@@ -149,27 +149,6 @@ final class CommandRunner {
     }
 }
 
-final class OutcomeStore: @unchecked Sendable {
-    private let lock = NSLock()
-    private var outcomes: [ProbeOutcome?]
-
-    init(count: Int) {
-        outcomes = Array(repeating: nil, count: count)
-    }
-
-    func set(_ outcome: ProbeOutcome, at index: Int) {
-        lock.lock()
-        outcomes[index] = outcome
-        lock.unlock()
-    }
-
-    func values() -> [ProbeOutcome?] {
-        lock.lock()
-        let copy = outcomes
-        lock.unlock()
-        return copy
-    }
-}
 
 final class ProbeEngine: @unchecked Sendable {
     private let timeout: TimeInterval
@@ -350,6 +329,7 @@ final class DashboardController: NSObject, NSApplicationDelegate, NSTableViewDat
     private var cycle = 0
     private var isRunning = false
     private let refreshInterval: TimeInterval = 5
+    private let probeInterval: TimeInterval = 0.2
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         buildWindow()
@@ -483,7 +463,7 @@ final class DashboardController: NSObject, NSApplicationDelegate, NSTableViewDat
         isRunning = true
         cycle += 1
         refreshButton.isEnabled = false
-        footerLabel.stringValue = "Cycle \(cycle) running..."
+        footerLabel.stringValue = "Cycle \(cycle) starting..."
 
         for index in rows.indices where rows[index].status != ProbeStatus.configBad {
             rows[index].status = ProbeStatus.checking
@@ -493,24 +473,35 @@ final class DashboardController: NSObject, NSApplicationDelegate, NSTableViewDat
 
         let snapshot = rows.map { $0.target }
         let engine = self.engine
+        let probeInterval = self.probeInterval
+        let totalProbes = snapshot.count
+        
         DispatchQueue.global(qos: .utility).async {
-            let group = DispatchGroup()
-            let store = OutcomeStore(count: snapshot.count)
-
+            var outcomes: [ProbeOutcome?] = Array(repeating: nil, count: totalProbes)
+            
             for (index, target) in snapshot.enumerated() {
-                group.enter()
-                DispatchQueue.global(qos: .utility).async {
-                    let outcome = engine.run(target)
-                    store.set(outcome, at: index)
-                    group.leave()
+                let outcome = engine.run(target)
+                outcomes[index] = outcome
+                
+                Task { @MainActor in
+                    self.updateProgress(current: index + 1, total: totalProbes)
+                }
+                
+                if index < totalProbes - 1 {
+                    Thread.sleep(forTimeInterval: probeInterval)
                 }
             }
-
-            group.wait()
-            let outcomes = store.values()
+            
             Task { @MainActor in
                 self.apply(outcomes: outcomes)
             }
+        }
+    }
+    
+    private func updateProgress(current: Int, total: Int) {
+        footerLabel.stringValue = "Cycle \(cycle): probe \(current)/\(total) running..."
+        if let rowIndex = rows.firstIndex(where: { $0.status == ProbeStatus.checking }) {
+            tableView.reloadData(forRowIndexes: IndexSet(integer: rowIndex), columnIndexes: IndexSet(integersIn: 0..<tableView.numberOfColumns))
         }
     }
 
