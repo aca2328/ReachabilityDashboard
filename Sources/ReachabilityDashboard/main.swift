@@ -203,9 +203,9 @@ final class ProbeEngine: @unchecked Sendable {
         case .icmpEcho:
             return ping(target.host)
         case .dnsRecursor:
-            return dig(target.host, arguments: ["+tries=1", "+time=\(\Int(timeout))", "@\(\target.host)", "example.com", "A"], requireNoError: true)
+            return dig(target.host, arguments: ["+tries=1", "+time=\(Int(timeout))", "@\(target.host)", "example.com", "A"], requireNoError: true)
         case .dnsAuth:
-            return dig(target.host, arguments: ["+tries=1", "+time=\(\Int(timeout))", "+norecurse", "@\(\target.host)", ".", "NS"], requireNoError: false)
+            return dig(target.host, arguments: ["+tries=1", "+time=\(Int(timeout))", "+norecurse", "@\(target.host)", ".", "NS"], requireNoError: false)
         case .httpsConnect:
             return curl(target.host, metric: .connect)
         case .httpsGet:
@@ -216,9 +216,9 @@ final class ProbeEngine: @unchecked Sendable {
     private func ping(_ host: String) -> ProbeOutcome {
         let timeoutArgument: String
         if ProcessInfo.processInfo.operatingSystemVersion.majorVersion >= 0 {
-            timeoutArgument = "\(\Int(timeout * 1000))"
+            timeoutArgument = "\(Int(timeout * 1000))"
         } else {
-            timeoutArgument = "\(\Int(timeout))"
+            timeoutArgument = "\(Int(timeout))"
         }
 
         let result = CommandRunner.run("/sbin/ping", ["-c", "1", "-W", timeoutArgument, host], timeout: timeout + 1)
@@ -263,7 +263,7 @@ final class ProbeEngine: @unchecked Sendable {
         let format = "%{time_connect} %{time_appconnect} %{time_total} %{http_code}"
         let result = CommandRunner.run(
             "/usr/bin/curl",
-            ["--silent", "--output", "/dev/null", "--max-time", "\(\Int(timeout))", "--write-out", format, "https://\(\host)/"],
+            ["--silent", "--output", "/dev/null", "--max-time", "\(Int(timeout))", "--write-out", format, "https://\(host)/"],
             timeout: timeout + 1
         )
 
@@ -448,7 +448,7 @@ final class DashboardController: NSObject, NSApplicationDelegate, NSTableViewDat
         window.contentView = root
         NSLayoutConstraint.activate([
             root.leadingAnchor.constraint(equalTo: window.contentView!.leadingAnchor),
-            root.trailingAnchor.constraint(equalTo: window.contentView!.traistingAnchor),
+            root.trailingAnchor.constraint(equalTo: window.contentView!.trailingAnchor),
             root.topAnchor.constraint(equalTo: window.contentView!.topAnchor),
             root.bottomAnchor.constraint(equalTo: window.contentView!.bottomAnchor),
             scrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 420)
