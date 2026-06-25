@@ -454,6 +454,7 @@ final class DashboardController: NSObject, NSApplicationDelegate {
     private var graphView: ProbeGraphView!
     private var footerLabel: NSTextField!
     private var refreshButton: NSButton!
+    private var versionLabel: NSTextField!
     private var rows: [ProbeRow] = {
         var rows = configuredTargets.map { ProbeRow(target: $0) }
         for i in 0..<rows.count {
@@ -469,6 +470,31 @@ final class DashboardController: NSObject, NSApplicationDelegate {
     private var isRunning = false
     private let refreshInterval: TimeInterval = 5
     private let probeInterval: TimeInterval = 0.2
+    
+    private var buildNumber: Int {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        process.arguments = ["rev-list", "--count", "HEAD"]
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = Pipe()
+        do {
+            try process.run()
+            process.waitUntilExit()
+            let data = output.fileHandleForReading.readDataToEndOfFile()
+            if let count = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+               let intValue = Int(count) {
+                return intValue
+            }
+        } catch {
+            return 0
+        }
+        return 0
+    }
+    
+    private var versionString: String {
+        "v1.0.\(buildNumber)"
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         buildWindow()
@@ -504,7 +530,7 @@ final class DashboardController: NSObject, NSApplicationDelegate {
         let title = NSTextField(labelWithString: "Operator Peering Quality")
         title.font = .systemFont(ofSize: 24, weight: .semibold)
 
-        let version = NSTextField(labelWithString: "v1.0.0")
+        let version = NSTextField(labelWithString: "")
         version.font = .systemFont(ofSize: 11)
         version.textColor = .secondaryLabelColor
 
@@ -519,6 +545,9 @@ final class DashboardController: NSObject, NSApplicationDelegate {
         let header = NSStackView(views: [title, subtitleLine])
         header.orientation = .vertical
         header.spacing = 4
+        
+        self.versionLabel = version
+        updateVersionLabel()
 
         refreshButton = NSButton(title: "Refresh Now", target: self, action: #selector(refreshNow))
         refreshButton.bezelStyle = .rounded
@@ -564,6 +593,10 @@ final class DashboardController: NSObject, NSApplicationDelegate {
             }
         }
         graphView.needsDisplay = true
+    }
+    
+    private func updateVersionLabel() {
+        versionLabel.stringValue = versionString
     }
 
     @objc private func refreshNow() {
