@@ -595,15 +595,7 @@ final class DashboardController: NSObject, NSApplicationDelegate {
     private var footerLabel: NSTextField!
     private var refreshButton: NSButton!
     private var versionLabel: NSTextField!
-    private var rows: [ProbeRow] = {
-        var rows = configuredTargets.map { ProbeRow(target: $0) }
-        for i in 0..<rows.count {
-            var row = rows[i]
-            row.latencyHistory = (0..<10).map { _ in Int.random(in: 20..<200) }
-            rows[i] = row
-        }
-        return rows
-    }()
+    private var rows: [ProbeRow] = configuredTargets.map { ProbeRow(target: $0) }
     private let engine = ProbeEngine(timeout: 3)
     private var timer: Timer?
     private var cycle = 0
