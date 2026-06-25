@@ -504,10 +504,19 @@ final class DashboardController: NSObject, NSApplicationDelegate {
         let title = NSTextField(labelWithString: "Operator Peering Quality")
         title.font = .systemFont(ofSize: 24, weight: .semibold)
 
+        let version = NSTextField(labelWithString: "v1.0.0")
+        version.font = .systemFont(ofSize: 11)
+        version.textColor = .secondaryLabelColor
+
         let subtitle = NSTextField(labelWithString: "Native macOS probe dashboard for ICMP, DNS, and HTTPS path quality.")
         subtitle.textColor = .secondaryLabelColor
 
-        let header = NSStackView(views: [title, subtitle])
+        let subtitleLine = NSStackView(views: [version, subtitle])
+        subtitleLine.orientation = .horizontal
+        subtitleLine.spacing = 8
+        subtitleLine.alignment = .centerY
+
+        let header = NSStackView(views: [title, subtitleLine])
         header.orientation = .vertical
         header.spacing = 4
 
