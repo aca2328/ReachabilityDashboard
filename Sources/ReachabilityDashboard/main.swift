@@ -365,28 +365,28 @@ final class ProbeGraphView: NSView {
         
         let bounds = self.bounds
         let padding: CGFloat = 60
+        let legendWidth: CGFloat = 200
         let graphRect = NSRect(
             x: padding,
             y: padding,
-            width: bounds.width - padding * 2,
+            width: bounds.width - padding * 2 - legendWidth,
             height: bounds.height - padding * 2
         )
         
-        ctx.setStrokeColor(NSColor.gridColor.cgColor)
-        ctx.setLineWidth(1)
+        let allLatencies = rows.flatMap { $0.latencyHistory.compactMap { $0 } }
+        let maxLatency = allLatencies.max() ?? 1000
+        let minLatency = allLatencies.min() ?? 0
+        let latencyRange = max(maxLatency - minLatency, 1)
+        let minLatencyFloat = CGFloat(minLatency)
         
-        let maxHistory = ProbeRow.maxHistoryPoints
-        let maxLatency = rows.compactMap { $0.latencyHistory.compactMap { $0 }.max() }.max() ?? 1000
-        let maxLatencyFloat = CGFloat(maxLatency)
-        
-        let yScale = graphRect.height / maxLatencyFloat
-        let xScale = graphRect.width / CGFloat(maxHistory - 1)
+        let yScale = graphRect.height / CGFloat(latencyRange)
+        let xScale = graphRect.width / CGFloat(ProbeRow.maxHistoryPoints - 1)
         
         for (rowIndex, row) in rows.enumerated() {
             let color = colors[rowIndex % colors.count]
             let history = row.latencyHistory
             
-            guard history.count > 1 else { continue }
+            guard !history.isEmpty else { continue }
             
             ctx.beginPath()
             ctx.setStrokeColor(color.cgColor)
@@ -394,7 +394,8 @@ final class ProbeGraphView: NSView {
             
             for (i, latency) in history.enumerated() {
                 let x = graphRect.minX + CGFloat(i) * xScale
-                let y = graphRect.maxY - (latency.map { CGFloat($0) * yScale } ?? 0)
+                let normalizedLatency = CGFloat(latency ?? 0)
+                let y = graphRect.maxY - ((normalizedLatency - minLatencyFloat) * yScale)
                 
                 if i == 0 {
                     ctx.move(to: CGPoint(x: x, y: y))
@@ -413,9 +414,9 @@ final class ProbeGraphView: NSView {
             let labelString = NSAttributedString(string: label, attributes: labelAttrs)
             let labelSize = labelString.size()
             labelString.draw(with: NSRect(
-                x: bounds.width - padding - labelSize.width,
-                y: graphRect.minY + CGFloat(rowIndex) * 18,
-                width: labelSize.width,
+                x: graphRect.maxX + 10,
+                y: graphRect.maxY - CGFloat(rowIndex) * 20,
+                width: legendWidth,
                 height: labelSize.height
             ), options: .usesLineFragmentOrigin)
         }
@@ -425,7 +426,7 @@ final class ProbeGraphView: NSView {
         
         for i in stride(from: 0, through: 5, by: 1) {
             let y = graphRect.minY + CGFloat(i) * graphRect.height / 5
-            let latencyValue = Int(maxLatencyFloat * (1 - CGFloat(i) / 5))
+            let latencyValue = Int(minLatencyFloat + CGFloat(latencyRange) * (1 - CGFloat(i) / 5))
             ctx.move(to: CGPoint(x: graphRect.minX, y: y))
             ctx.addLine(to: CGPoint(x: graphRect.maxX, y: y))
             ctx.strokePath()
@@ -453,7 +454,15 @@ final class DashboardController: NSObject, NSApplicationDelegate {
     private var graphView: ProbeGraphView!
     private var footerLabel: NSTextField!
     private var refreshButton: NSButton!
-    private var rows = configuredTargets.map { ProbeRow(target: $0) }
+    private var rows: [ProbeRow] = {
+        var rows = configuredTargets.map { ProbeRow(target: $0) }
+        for i in 0..<rows.count {
+            var row = rows[i]
+            row.latencyHistory = (0..<10).map { _ in Int.random(in: 20..<200) }
+            rows[i] = row
+        }
+        return rows
+    }()
     private let engine = ProbeEngine(timeout: 3)
     private var timer: Timer?
     private var cycle = 0
