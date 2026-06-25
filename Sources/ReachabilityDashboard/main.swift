@@ -351,99 +351,239 @@ final class ProbeEngine: @unchecked Sendable {
 
 final class ProbeGraphView: NSView {
     var rows: [ProbeRow] = []
+
     private let colors: [NSColor] = [
         .systemRed, .systemBlue, .systemGreen, .systemOrange, .systemPurple,
         .systemYellow, .systemPink, .systemTeal, .systemCyan, .systemBrown,
         .systemIndigo, .systemGray
     ]
-    
+
+    private let backgroundColor = NSColor(calibratedRed: 0.055, green: 0.067, blue: 0.10, alpha: 1)
+    private let gridColor = NSColor(calibratedRed: 1, green: 1, blue: 1, alpha: 0.07)
+    private let axisTextColor = NSColor(calibratedRed: 1, green: 1, blue: 1, alpha: 0.45)
+
     override func draw(_ dirtyRect: NSRect) {
-        guard !rows.isEmpty else { return }
-        
-        let context = NSGraphicsContext.current?.cgContext
-        guard let ctx = context else { return }
-        
+        guard let ctx = NSGraphicsContext.current?.cgContext else { return }
+
         let bounds = self.bounds
-        let padding: CGFloat = 60
-        let legendWidth: CGFloat = 200
+
+        // Dark rounded canvas.
+        let canvas = NSBezierPath(roundedRect: bounds, xRadius: 14, yRadius: 14)
+        backgroundColor.setFill()
+        canvas.fill()
+
+        guard !rows.isEmpty else { return }
+
+        let leftPad: CGFloat = 64
+        let topPad: CGFloat = 48
+        let bottomPad: CGFloat = 32
+        let legendWidth: CGFloat = 220
+        let rightPad: CGFloat = 24
         let graphRect = NSRect(
-            x: padding,
-            y: padding,
-            width: bounds.width - padding * 2 - legendWidth,
-            height: bounds.height - padding * 2
+            x: leftPad,
+            y: bottomPad,
+            width: bounds.width - leftPad - legendWidth - rightPad,
+            height: bounds.height - topPad - bottomPad
         )
-        
+        guard graphRect.width > 40, graphRect.height > 40 else { return }
+
+        drawTitle("LATENCY OVER TIME", at: CGPoint(x: leftPad, y: bounds.maxY - 32))
+
         let allLatencies = rows.flatMap { $0.latencyHistory.compactMap { $0 } }
-        let maxLatency = allLatencies.max() ?? 1000
-        let minLatency = allLatencies.min() ?? 0
+        let rawMax = allLatencies.max() ?? 100
+        let rawMin = allLatencies.min() ?? 0
+        let maxLatency = CGFloat(rawMax) + CGFloat(max(rawMax - rawMin, 10)) * 0.12
+        let minLatency = max(0, CGFloat(rawMin) - CGFloat(max(rawMax - rawMin, 10)) * 0.05)
         let latencyRange = max(maxLatency - minLatency, 1)
-        let minLatencyFloat = CGFloat(minLatency)
-        
-        let yScale = graphRect.height / CGFloat(latencyRange)
-        let xScale = graphRect.width / CGFloat(ProbeRow.maxHistoryPoints - 1)
-        
+
+        let pointCount = rows.map { $0.latencyHistory.count }.max() ?? 0
+        let xDenom = CGFloat(max(pointCount - 1, 1))
+        let xScale = graphRect.width / xDenom
+
+        func point(_ index: Int, _ value: Int) -> CGPoint {
+            let x = graphRect.minX + CGFloat(index) * xScale
+            let y = graphRect.minY + (CGFloat(value) - minLatency) / latencyRange * graphRect.height
+            return CGPoint(x: x, y: y)
+        }
+
+        drawGrid(ctx, in: graphRect, minLatency: minLatency, latencyRange: latencyRange)
+
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+
         for (rowIndex, row) in rows.enumerated() {
             let color = colors[rowIndex % colors.count]
-            let history = row.latencyHistory
-            
-            guard !history.isEmpty else { continue }
-            
-            ctx.beginPath()
-            ctx.setStrokeColor(color.cgColor)
-            ctx.setLineWidth(2)
-            
-            for (i, latency) in history.enumerated() {
-                let x = graphRect.minX + CGFloat(i) * xScale
-                let normalizedLatency = CGFloat(latency ?? 0)
-                let y = graphRect.maxY - ((normalizedLatency - minLatencyFloat) * yScale)
-                
-                if i == 0 {
-                    ctx.move(to: CGPoint(x: x, y: y))
-                } else {
-                    ctx.addLine(to: CGPoint(x: x, y: y))
+            // Split into contiguous segments so failed probes break the line
+            // instead of plunging it to the floor.
+            var segments: [[CGPoint]] = []
+            var current: [CGPoint] = []
+            for (i, latency) in row.latencyHistory.enumerated() {
+                if let latency {
+                    current.append(point(i, latency))
+                } else if !current.isEmpty {
+                    segments.append(current)
+                    current = []
                 }
             }
-            
-            ctx.strokePath()
-            
-            let label = row.target.name
-            let labelAttrs: [NSAttributedString.Key: Any] = [
-                .font: NSFont.systemFont(ofSize: 11),
-                .foregroundColor: color
-            ]
-            let labelString = NSAttributedString(string: label, attributes: labelAttrs)
-            let labelSize = labelString.size()
-            labelString.draw(with: NSRect(
-                x: graphRect.maxX + 10,
-                y: graphRect.maxY - CGFloat(rowIndex) * 20,
-                width: legendWidth,
-                height: labelSize.height
-            ), options: .usesLineFragmentOrigin)
+            if !current.isEmpty { segments.append(current) }
+            guard !segments.isEmpty else { continue }
+
+            for pts in segments {
+                drawAreaFill(ctx, points: pts, baseline: graphRect.minY,
+                             top: graphRect.maxY, color: color, colorSpace: colorSpace)
+                drawGlowLine(ctx, points: pts, color: color)
+            }
+
+            if let end = segments.last?.last {
+                drawEndDot(ctx, at: end, color: color)
+            }
         }
-        
-        ctx.setStrokeColor(NSColor.labelColor.withSystemEffect(.disabled).cgColor)
+
+        drawLegend(graphRect: graphRect, legendWidth: legendWidth)
+    }
+
+    private func drawTitle(_ text: String, at origin: CGPoint) {
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 13, weight: .semibold),
+            .foregroundColor: NSColor(calibratedRed: 1, green: 1, blue: 1, alpha: 0.75),
+            .kern: 2.0
+        ]
+        NSAttributedString(string: text, attributes: attrs)
+            .draw(at: origin)
+    }
+
+    private func drawGrid(_ ctx: CGContext, in rect: NSRect, minLatency: CGFloat, latencyRange: CGFloat) {
         ctx.setLineWidth(1)
-        
-        for i in stride(from: 0, through: 5, by: 1) {
-            let y = graphRect.minY + CGFloat(i) * graphRect.height / 5
-            let latencyValue = Int(minLatencyFloat + CGFloat(latencyRange) * (1 - CGFloat(i) / 5))
-            ctx.move(to: CGPoint(x: graphRect.minX, y: y))
-            ctx.addLine(to: CGPoint(x: graphRect.maxX, y: y))
+        for i in 0...5 {
+            let y = rect.minY + CGFloat(i) * rect.height / 5
+            ctx.setStrokeColor(gridColor.cgColor)
+            ctx.move(to: CGPoint(x: rect.minX, y: y))
+            ctx.addLine(to: CGPoint(x: rect.maxX, y: y))
             ctx.strokePath()
-            
-            let text = "\(latencyValue) ms"
-            let textAttrs: [NSAttributedString.Key: Any] = [
-                .font: NSFont.systemFont(ofSize: 10),
-                .foregroundColor: NSColor.labelColor.withSystemEffect(.disabled)
-            ]
-            let textString = NSAttributedString(string: text, attributes: textAttrs)
-            let textSize = textString.size()
-            textString.draw(with: NSRect(
-                x: graphRect.minX - textSize.width - 5,
-                y: y - textSize.height / 2,
-                width: textSize.width,
-                height: textSize.height
-            ), options: .usesLineFragmentOrigin)
+
+            let value = Int((minLatency + latencyRange * CGFloat(i) / 5).rounded())
+            let label = NSAttributedString(string: "\(value) ms", attributes: [
+                .font: NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .regular),
+                .foregroundColor: axisTextColor
+            ])
+            let size = label.size()
+            label.draw(at: CGPoint(x: rect.minX - size.width - 8, y: y - size.height / 2))
+        }
+    }
+
+    private func drawAreaFill(_ ctx: CGContext, points: [CGPoint], baseline: CGFloat,
+                              top: CGFloat, color: NSColor, colorSpace: CGColorSpace) {
+        guard points.count >= 2 else { return }
+        ctx.saveGState()
+        let fill = CGMutablePath()
+        fill.move(to: CGPoint(x: points[0].x, y: baseline))
+        fill.addLine(to: points[0])
+        addSmoothCurve(to: fill, through: points)
+        fill.addLine(to: CGPoint(x: points.last!.x, y: baseline))
+        fill.closeSubpath()
+        ctx.addPath(fill)
+        ctx.clip()
+
+        let gradient = CGGradient(colorsSpace: colorSpace,
+                                  colors: [color.withAlphaComponent(0.40).cgColor,
+                                           color.withAlphaComponent(0.0).cgColor] as CFArray,
+                                  locations: [0, 1])!
+        ctx.drawLinearGradient(gradient,
+                               start: CGPoint(x: 0, y: top),
+                               end: CGPoint(x: 0, y: baseline),
+                               options: [])
+        ctx.restoreGState()
+    }
+
+    private func drawGlowLine(_ ctx: CGContext, points: [CGPoint], color: NSColor) {
+        guard !points.isEmpty else { return }
+        ctx.saveGState()
+        ctx.setShadow(offset: .zero, blur: 9, color: color.withAlphaComponent(0.9).cgColor)
+        ctx.setStrokeColor(color.cgColor)
+        ctx.setLineWidth(2.5)
+        ctx.setLineJoin(.round)
+        ctx.setLineCap(.round)
+        let line = CGMutablePath()
+        line.move(to: points[0])
+        addSmoothCurve(to: line, through: points)
+        ctx.addPath(line)
+        ctx.strokePath()
+        ctx.restoreGState()
+
+        if points.count == 1 {
+            drawEndDot(ctx, at: points[0], color: color)
+        }
+    }
+
+    /// Appends a Catmull-Rom spline through `points` to `path`, which must
+    /// already be positioned at `points[0]`. Produces smooth curved lines.
+    private func addSmoothCurve(to path: CGMutablePath, through points: [CGPoint]) {
+        guard points.count > 1 else { return }
+        guard points.count > 2 else {
+            path.addLine(to: points[1])
+            return
+        }
+        for i in 0..<(points.count - 1) {
+            let p0 = points[max(i - 1, 0)]
+            let p1 = points[i]
+            let p2 = points[i + 1]
+            let p3 = points[min(i + 2, points.count - 1)]
+            let c1 = CGPoint(x: p1.x + (p2.x - p0.x) / 6.0, y: p1.y + (p2.y - p0.y) / 6.0)
+            let c2 = CGPoint(x: p2.x - (p3.x - p1.x) / 6.0, y: p2.y - (p3.y - p1.y) / 6.0)
+            path.addCurve(to: p2, control1: c1, control2: c2)
+        }
+    }
+
+    private func drawEndDot(_ ctx: CGContext, at point: CGPoint, color: NSColor) {
+        ctx.saveGState()
+        ctx.setShadow(offset: .zero, blur: 12, color: color.cgColor)
+        ctx.setFillColor(color.cgColor)
+        let r: CGFloat = 4
+        ctx.fillEllipse(in: CGRect(x: point.x - r, y: point.y - r, width: r * 2, height: r * 2))
+        ctx.restoreGState()
+
+        ctx.setFillColor(NSColor.white.withAlphaComponent(0.9).cgColor)
+        ctx.fillEllipse(in: CGRect(x: point.x - 1.5, y: point.y - 1.5, width: 3, height: 3))
+    }
+
+    private func drawLegend(graphRect: NSRect, legendWidth: CGFloat) {
+        let x = graphRect.maxX + 24
+        var y = graphRect.maxY - 10
+        let rowHeight: CGFloat = 26
+
+        for (rowIndex, row) in rows.enumerated() {
+            let color = colors[rowIndex % colors.count]
+            let active = row.status == .ok
+            let dim: CGFloat = active ? 1.0 : 0.4
+
+            // Swatch.
+            let swatch = NSBezierPath(ovalIn: NSRect(x: x, y: y - 9, width: 9, height: 9))
+            color.withAlphaComponent(dim).setFill()
+            swatch.fill()
+
+            // Name.
+            let name = NSAttributedString(string: row.target.name, attributes: [
+                .font: NSFont.systemFont(ofSize: 12, weight: .medium),
+                .foregroundColor: NSColor(calibratedRed: 1, green: 1, blue: 1, alpha: 0.85 * dim)
+            ])
+            name.draw(at: CGPoint(x: x + 16, y: y - 13))
+
+            // Current value + trend arrow, right-aligned in the legend column.
+            let arrow: String
+            switch row.trend {
+            case "up": arrow = " ↑"
+            case "down": arrow = " ↓"
+            case "flat": arrow = " ↔"
+            default: arrow = ""
+            }
+            let valueString = row.latencyMs.map { "\($0) ms\(arrow)" } ?? "—"
+            let value = NSAttributedString(string: valueString, attributes: [
+                .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular),
+                .foregroundColor: color.withAlphaComponent(dim)
+            ])
+            let size = value.size()
+            value.draw(at: CGPoint(x: x + legendWidth - size.width - 28, y: y - 13))
+
+            y -= rowHeight
         }
     }
 }
@@ -468,8 +608,8 @@ final class DashboardController: NSObject, NSApplicationDelegate {
     private var timer: Timer?
     private var cycle = 0
     private var isRunning = false
-    private let refreshInterval: TimeInterval = 5
-    private let probeInterval: TimeInterval = 0.2
+    private let refreshInterval: TimeInterval = 0.3
+    private let probeInterval: TimeInterval = 0
     
     private var buildNumber: Int {
         let process = Process()
@@ -562,12 +702,22 @@ final class DashboardController: NSObject, NSApplicationDelegate {
 
         graphView = ProbeGraphView()
         graphView.rows = rows
-        
+        graphView.translatesAutoresizingMaskIntoConstraints = false
+
         let scrollView = NSScrollView()
         scrollView.documentView = graphView
-        scrollView.hasVerticalScroller = true
-        scrollView.hasHorizontalScroller = true
+        scrollView.hasVerticalScroller = false
+        scrollView.hasHorizontalScroller = false
         scrollView.borderType = .bezelBorder
+
+        // Pin the graph to fill the visible area so the dark canvas always
+        // covers the bezel and the chart scales to the window.
+        NSLayoutConstraint.activate([
+            graphView.leadingAnchor.constraint(equalTo: scrollView.contentView.leadingAnchor),
+            graphView.trailingAnchor.constraint(equalTo: scrollView.contentView.trailingAnchor),
+            graphView.topAnchor.constraint(equalTo: scrollView.contentView.topAnchor),
+            graphView.bottomAnchor.constraint(equalTo: scrollView.contentView.bottomAnchor)
+        ])
 
         root.addArrangedSubview(header)
         root.addArrangedSubview(scrollView)
