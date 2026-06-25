@@ -49,6 +49,9 @@ struct ProbeRow {
     var successCount = 0
     var totalCount = 0
     var lastError: String?
+    var latencyHistory: [Int?] = []
+    
+    static let maxHistoryPoints = 50
 
     var successRate: String {
         guard totalCount > 0 else { return "-" }
@@ -66,6 +69,13 @@ struct ProbeRow {
         if delta > 5 { return "up" }
         if delta < -5 { return "down" }
         return "flat"
+    }
+    
+    mutating func addLatency(_ latency: Int?) {
+        latencyHistory.append(latency)
+        if latencyHistory.count > ProbeRow.maxHistoryPoints {
+            latencyHistory.removeFirst()
+        }
     }
 }
 
@@ -339,10 +349,108 @@ final class ProbeEngine: @unchecked Sendable {
     }
 }
 
+final class ProbeGraphView: NSView {
+    var rows: [ProbeRow] = []
+    private let colors: [NSColor] = [
+        .systemRed, .systemBlue, .systemGreen, .systemOrange, .systemPurple,
+        .systemYellow, .systemPink, .systemTeal, .systemCyan, .systemBrown,
+        .systemIndigo, .systemGray
+    ]
+    
+    override func draw(_ dirtyRect: NSRect) {
+        guard !rows.isEmpty else { return }
+        
+        let context = NSGraphicsContext.current?.cgContext
+        guard let ctx = context else { return }
+        
+        let bounds = self.bounds
+        let padding: CGFloat = 60
+        let graphRect = NSRect(
+            x: padding,
+            y: padding,
+            width: bounds.width - padding * 2,
+            height: bounds.height - padding * 2
+        )
+        
+        ctx.setStrokeColor(NSColor.gridColor.cgColor)
+        ctx.setLineWidth(1)
+        
+        let maxHistory = ProbeRow.maxHistoryPoints
+        let maxLatency = rows.compactMap { $0.latencyHistory.compactMap { $0 }.max() }.max() ?? 1000
+        let maxLatencyFloat = CGFloat(maxLatency)
+        
+        let yScale = graphRect.height / maxLatencyFloat
+        let xScale = graphRect.width / CGFloat(maxHistory - 1)
+        
+        for (rowIndex, row) in rows.enumerated() {
+            let color = colors[rowIndex % colors.count]
+            let history = row.latencyHistory
+            
+            guard history.count > 1 else { continue }
+            
+            ctx.beginPath()
+            ctx.setStrokeColor(color.cgColor)
+            ctx.setLineWidth(2)
+            
+            for (i, latency) in history.enumerated() {
+                let x = graphRect.minX + CGFloat(i) * xScale
+                let y = graphRect.maxY - (latency.map { CGFloat($0) * yScale } ?? 0)
+                
+                if i == 0 {
+                    ctx.move(to: CGPoint(x: x, y: y))
+                } else {
+                    ctx.addLine(to: CGPoint(x: x, y: y))
+                }
+            }
+            
+            ctx.strokePath()
+            
+            let label = row.target.name
+            let labelAttrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: 11),
+                .foregroundColor: color
+            ]
+            let labelString = NSAttributedString(string: label, attributes: labelAttrs)
+            let labelSize = labelString.size()
+            labelString.draw(with: NSRect(
+                x: bounds.width - padding - labelSize.width,
+                y: graphRect.minY + CGFloat(rowIndex) * 18,
+                width: labelSize.width,
+                height: labelSize.height
+            ), options: .usesLineFragmentOrigin)
+        }
+        
+        ctx.setStrokeColor(NSColor.labelColor.withSystemEffect(.disabled).cgColor)
+        ctx.setLineWidth(1)
+        
+        for i in stride(from: 0, through: 5, by: 1) {
+            let y = graphRect.minY + CGFloat(i) * graphRect.height / 5
+            let latencyValue = Int(maxLatencyFloat * (1 - CGFloat(i) / 5))
+            ctx.move(to: CGPoint(x: graphRect.minX, y: y))
+            ctx.addLine(to: CGPoint(x: graphRect.maxX, y: y))
+            ctx.strokePath()
+            
+            let text = "\(latencyValue) ms"
+            let textAttrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: 10),
+                .foregroundColor: NSColor.labelColor.withSystemEffect(.disabled)
+            ]
+            let textString = NSAttributedString(string: text, attributes: textAttrs)
+            let textSize = textString.size()
+            textString.draw(with: NSRect(
+                x: graphRect.minX - textSize.width - 5,
+                y: y - textSize.height / 2,
+                width: textSize.width,
+                height: textSize.height
+            ), options: .usesLineFragmentOrigin)
+        }
+    }
+}
+
 @MainActor
-final class DashboardController: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTableViewDelegate {
+final class DashboardController: NSObject, NSApplicationDelegate {
     private var window: NSWindow!
-    private var tableView: NSTableView!
+    private var graphView: ProbeGraphView!
     private var footerLabel: NSTextField!
     private var refreshButton: NSButton!
     private var rows = configuredTargets.map { ProbeRow(target: $0) }
@@ -366,22 +474,6 @@ final class DashboardController: NSObject, NSApplicationDelegate, NSTableViewDat
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         true
-    }
-
-    func numberOfRows(in tableView: NSTableView) -> Int {
-        rows.count
-    }
-
-    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
-        let identifier = tableColumn?.identifier.rawValue ?? ""
-        let cell = tableView.makeView(withIdentifier: NSUserInterfaceItemIdentifier(identifier), owner: self) as? NSTextField
-            ?? NSTextField(labelWithString: "")
-        cell.identifier = NSUserInterfaceItemIdentifier(identifier)
-        cell.lineBreakMode = .byTruncatingTail
-        cell.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
-        cell.textColor = color(for: rows[row], column: identifier)
-        cell.stringValue = value(for: rows[row], column: identifier)
-        return cell
     }
 
     private func buildWindow() {
@@ -421,26 +513,13 @@ final class DashboardController: NSObject, NSApplicationDelegate, NSTableViewDat
         controls.alignment = .centerY
         controls.spacing = 12
 
-        tableView = NSTableView()
-        tableView.delegate = self
-        tableView.dataSource = self
-        tableView.usesAlternatingRowBackgroundColors = true
-        tableView.rowHeight = 28
-        tableView.headerView = NSTableHeaderView()
-
-        addColumn("name", "Target", 170)
-        addColumn("network", "Network", 160)
-        addColumn("scope", "Scope", 120)
-        addColumn("probe", "Probe", 90)
-        addColumn("status", "Status", 110)
-        addColumn("latency", "RTT/Time", 90)
-        addColumn("trend", "Trend", 70)
-        addColumn("success", "Success", 80)
-        addColumn("error", "Last Error", 230)
-
+        graphView = ProbeGraphView()
+        graphView.rows = rows
+        
         let scrollView = NSScrollView()
-        scrollView.documentView = tableView
+        scrollView.documentView = graphView
         scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = true
         scrollView.borderType = .bezelBorder
 
         root.addArrangedSubview(header)
@@ -459,13 +538,6 @@ final class DashboardController: NSObject, NSApplicationDelegate, NSTableViewDat
         window.makeKeyAndOrderFront(nil)
     }
 
-    private func addColumn(_ identifier: String, _ title: String, _ width: CGFloat) {
-        let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(identifier))
-        column.title = title
-        column.width = width
-        tableView.addTableColumn(column)
-    }
-
     private func validateRows() {
         for index in rows.indices {
             if let error = engine.validate(rows[index].target) {
@@ -473,7 +545,7 @@ final class DashboardController: NSObject, NSApplicationDelegate, NSTableViewDat
                 rows[index].lastError = error
             }
         }
-        tableView.reloadData()
+        graphView.needsDisplay = true
     }
 
     @objc private func refreshNow() {
@@ -491,7 +563,7 @@ final class DashboardController: NSObject, NSApplicationDelegate, NSTableViewDat
             rows[index].status = ProbeStatus.checking
             rows[index].lastError = nil
         }
-        tableView.reloadData()
+        graphView.needsDisplay = true
 
         let snapshot = rows.map { $0.target }
         let engine = self.engine
@@ -523,7 +595,7 @@ final class DashboardController: NSObject, NSApplicationDelegate, NSTableViewDat
     
     private func updateProgress(current: Int, total: Int) {
         footerLabel.stringValue = "Cycle \(cycle): probe \(current)/\(total) running..."
-        tableView.reloadData()
+        graphView.needsDisplay = true
     }
 
     private func apply(outcomes: [ProbeOutcome?]) {
@@ -538,6 +610,8 @@ final class DashboardController: NSObject, NSApplicationDelegate, NSTableViewDat
             rows[index].totalCount += 1
             rows[index].status = outcome.status
             rows[index].lastError = outcome.error
+            
+            rows[index].addLatency(outcome.latencyMs)
 
             if outcome.status == ProbeStatus.ok {
                 rows[index].successCount += 1
@@ -557,46 +631,13 @@ final class DashboardController: NSObject, NSApplicationDelegate, NSTableViewDat
             }
         }
 
+        graphView.rows = rows
+        
         let avg = latencyCount > 0 ? "\(latencyTotal / latencyCount) ms avg" : "no latency samples"
         footerLabel.stringValue = "Cycle \(cycle): \(okCount)/\(rows.count) probes OK, \(badConfigCount) config bad, \(avg). Next refresh in \(Int(refreshInterval))s."
         refreshButton.isEnabled = true
         isRunning = false
-        tableView.reloadData()
-    }
-
-    private func value(for row: ProbeRow, column: String) -> String {
-        switch column {
-        case "name": row.target.name
-        case "network": row.target.network
-        case "scope": row.target.scope
-        case "probe": row.target.probe.label
-        case "status": row.status.rawValue
-        case "latency": row.latencyText
-        case "trend": row.trend
-        case "success": row.successRate
-        case "error": row.lastError ?? ""
-        default: ""
-        }
-    }
-
-    private func color(for row: ProbeRow, column: String) -> NSColor {
-        if column == "status" {
-            switch row.status {
-            case .ok: return .systemGreen
-            case .checking: return .systemBlue
-            case .configBad: return .systemOrange
-            case .failed: return .systemRed
-            case .pending: return .secondaryLabelColor
-            }
-        }
-
-        if column == "latency", let latency = row.latencyMs {
-            if latency < 50 { return .systemGreen }
-            if latency < 150 { return .systemOrange }
-            return .systemRed
-        }
-
-        return .labelColor
+        graphView.needsDisplay = true
     }
 }
 
