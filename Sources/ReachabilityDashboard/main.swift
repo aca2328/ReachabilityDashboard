@@ -17,6 +17,18 @@ enum ProbeType: String {
         case .httpsGet: "HTTPS-GET"
         }
     }
+
+    // Heavier probes (full HTTPS GET, authoritative root DNS) refresh less
+    // often so we don't hammer those targets as hard as a plain ping.
+    var refreshInterval: TimeInterval {
+        switch self {
+        case .icmpEcho: 1.0
+        case .dnsRecursor: 1.0
+        case .dnsAuth: 3.0
+        case .httpsConnect: 2.0
+        case .httpsGet: 5.0
+        }
+    }
 }
 
 enum ProbeStatus: String {
@@ -49,6 +61,9 @@ struct ProbeRow {
     var successCount = 0
     var totalCount = 0
     var lastError: String?
+    var latencyHistory: [Int?] = []
+    
+    static let maxHistoryPoints = 50
 
     var successRate: String {
         guard totalCount > 0 else { return "-" }
@@ -66,6 +81,13 @@ struct ProbeRow {
         if delta > 5 { return "up" }
         if delta < -5 { return "down" }
         return "flat"
+    }
+    
+    mutating func addLatency(_ latency: Int?) {
+        latencyHistory.append(latency)
+        if latencyHistory.count > ProbeRow.maxHistoryPoints {
+            latencyHistory.removeFirst()
+        }
     }
 }
 
@@ -150,28 +172,6 @@ final class CommandRunner {
 }
 
 
-final class OutcomeCollection: @unchecked Sendable {
-    private let lock = NSLock()
-    private var outcomes: [ProbeOutcome?]
-
-    init(count: Int) {
-        outcomes = Array(repeating: nil, count: count)
-    }
-
-    func set(_ outcome: ProbeOutcome, at index: Int) {
-        lock.lock()
-        outcomes[index] = outcome
-        lock.unlock()
-    }
-
-    func values() -> [ProbeOutcome?] {
-        lock.lock()
-        let copy = outcomes
-        lock.unlock()
-        return copy
-    }
-}
-
 final class ProbeEngine: @unchecked Sendable {
     private let timeout: TimeInterval
 
@@ -227,6 +227,10 @@ final class ProbeEngine: @unchecked Sendable {
             return failure(from: result)
         }
 
+        return parsePingOutput(output)
+    }
+
+    func parsePingOutput(_ output: String) -> ProbeOutcome {
         if let latency = firstMatch(in: output, pattern: #"time=([0-9.]+)"#).flatMap(milliseconds) {
             return .init(status: .ok, latencyMs: latency, error: nil)
         }
@@ -240,6 +244,10 @@ final class ProbeEngine: @unchecked Sendable {
             return failure(from: result)
         }
 
+        return parseDigOutput(output, requireNoError: requireNoError)
+    }
+
+    func parseDigOutput(_ output: String, requireNoError: Bool) -> ProbeOutcome {
         if requireNoError, !output.contains("status: NOERROR") {
             return .init(status: .failed, latencyMs: nil, error: "DNS status not NOERROR")
         }
@@ -255,7 +263,7 @@ final class ProbeEngine: @unchecked Sendable {
         return .init(status: .failed, latencyMs: nil, error: "no query time")
     }
 
-    private enum CurlMetric {
+    enum CurlMetric {
         case connect
         case total
     }
@@ -272,6 +280,10 @@ final class ProbeEngine: @unchecked Sendable {
             return failure(from: result)
         }
 
+        return parseCurlOutput(output, metric: metric)
+    }
+
+    func parseCurlOutput(_ output: String, metric: CurlMetric) -> ProbeOutcome {
         let parts = output.split(separator: " ").map(String.init)
         guard parts.count == 4 else {
             return .init(status: .failed, latencyMs: nil, error: "bad curl metrics")
@@ -307,7 +319,7 @@ final class ProbeEngine: @unchecked Sendable {
         FileManager.default.isExecutableFile(atPath: path)
     }
 
-    private func isIPv4(_ value: String) -> Bool {
+    func isIPv4(_ value: String) -> Bool {
         let parts = value.split(separator: ".")
         guard parts.count == 4 else { return false }
         return parts.allSatisfy { part in
@@ -316,7 +328,7 @@ final class ProbeEngine: @unchecked Sendable {
         }
     }
 
-    private func isHostname(_ value: String) -> Bool {
+    func isHostname(_ value: String) -> Bool {
         guard value.count <= 253, value.contains(".") else { return false }
         let labels = value.split(separator: ".")
         return labels.allSatisfy { label in
@@ -339,49 +351,321 @@ final class ProbeEngine: @unchecked Sendable {
     }
 }
 
+final class ProbeGraphView: NSView {
+    var rows: [ProbeRow] = []
+
+    private let colors: [NSColor] = [
+        .systemRed, .systemBlue, .systemGreen, .systemOrange, .systemPurple,
+        .systemYellow, .systemPink, .systemTeal, .systemCyan, .systemBrown,
+        .systemIndigo, .systemGray
+    ]
+
+    private let backgroundColor = NSColor(calibratedRed: 0.055, green: 0.067, blue: 0.10, alpha: 1)
+    private let gridColor = NSColor(calibratedRed: 1, green: 1, blue: 1, alpha: 0.07)
+    private let axisTextColor = NSColor(calibratedRed: 1, green: 1, blue: 1, alpha: 0.45)
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard let ctx = NSGraphicsContext.current?.cgContext else { return }
+
+        let bounds = self.bounds
+
+        // Dark rounded canvas.
+        let canvas = NSBezierPath(roundedRect: bounds, xRadius: 14, yRadius: 14)
+        backgroundColor.setFill()
+        canvas.fill()
+
+        guard !rows.isEmpty else { return }
+
+        let leftPad: CGFloat = 64
+        let topPad: CGFloat = 48
+        let bottomPad: CGFloat = 32
+        let labelGutter: CGFloat = 180
+        let rightPad: CGFloat = 16
+        let graphRect = NSRect(
+            x: leftPad,
+            y: bottomPad,
+            width: bounds.width - leftPad - labelGutter - rightPad,
+            height: bounds.height - topPad - bottomPad
+        )
+        guard graphRect.width > 40, graphRect.height > 40 else { return }
+
+        drawTitle("LATENCY OVER TIME", at: CGPoint(x: leftPad, y: bounds.maxY - 32))
+
+        let allLatencies = rows.flatMap { $0.latencyHistory.compactMap { $0 } }
+        let rawMax = allLatencies.max() ?? 100
+        let rawMin = allLatencies.min() ?? 0
+        let maxLatency = CGFloat(rawMax) + CGFloat(max(rawMax - rawMin, 10)) * 0.12
+        let minLatency = max(0, CGFloat(rawMin) - CGFloat(max(rawMax - rawMin, 10)) * 0.05)
+        let latencyRange = max(maxLatency - minLatency, 1)
+
+        let pointCount = rows.map { $0.latencyHistory.count }.max() ?? 0
+        let xDenom = CGFloat(max(pointCount - 1, 1))
+        let xScale = graphRect.width / xDenom
+
+        func point(_ index: Int, _ value: Int) -> CGPoint {
+            let x = graphRect.minX + CGFloat(index) * xScale
+            let y = graphRect.minY + (CGFloat(value) - minLatency) / latencyRange * graphRect.height
+            return CGPoint(x: x, y: y)
+        }
+
+        drawGrid(ctx, in: graphRect, minLatency: minLatency, latencyRange: latencyRange)
+
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+
+        var labels: [FloatingLabel] = []
+
+        for (rowIndex, row) in rows.enumerated() {
+            let color = colors[rowIndex % colors.count]
+            // Split into contiguous segments so failed probes break the line
+            // instead of plunging it to the floor.
+            var segments: [[CGPoint]] = []
+            var current: [CGPoint] = []
+            for (i, latency) in row.latencyHistory.enumerated() {
+                if let latency {
+                    current.append(point(i, latency))
+                } else if !current.isEmpty {
+                    segments.append(current)
+                    current = []
+                }
+            }
+            if !current.isEmpty { segments.append(current) }
+            guard !segments.isEmpty else { continue }
+
+            for pts in segments {
+                drawAreaFill(ctx, points: pts, baseline: graphRect.minY,
+                             top: graphRect.maxY, color: color, colorSpace: colorSpace)
+                drawGlowLine(ctx, points: pts, color: color)
+            }
+
+            if let end = segments.last?.last {
+                drawEndDot(ctx, at: end, color: color)
+                labels.append(FloatingLabel(text: labelText(for: row), color: color,
+                                            anchor: end, active: row.status == .ok))
+            }
+        }
+
+        drawFloatingLabels(ctx, labels, graphRect: graphRect)
+    }
+
+    private struct FloatingLabel {
+        let text: String
+        let color: NSColor
+        let anchor: CGPoint
+        let active: Bool
+    }
+
+    private func labelText(for row: ProbeRow) -> String {
+        let arrow: String
+        switch row.trend {
+        case "up": arrow = " ↑"
+        case "down": arrow = " ↓"
+        case "flat": arrow = " ↔"
+        default: arrow = ""
+        }
+        if let latency = row.latencyMs {
+            return "\(row.target.name)  \(latency) ms\(arrow)"
+        }
+        return row.target.name
+    }
+
+    /// Draws each probe's label floating next to the end of its line. Labels
+    /// are nudged apart vertically so they stay readable when lines cluster,
+    /// with a faint connector back to the line's last point.
+    private func drawFloatingLabels(_ ctx: CGContext, _ labels: [FloatingLabel], graphRect: NSRect) {
+        guard !labels.isEmpty else { return }
+        let font = NSFont.systemFont(ofSize: 11, weight: .medium)
+        let lineHeight = font.ascender - font.descender
+        let minGap = lineHeight + 4
+        let labelX = graphRect.maxX + 14
+
+        // Resolve vertical collisions from the top down.
+        let placed = labels.sorted { $0.anchor.y > $1.anchor.y }
+        var ys = placed.map { $0.anchor.y }
+        for i in 1..<ys.count where ys[i - 1] - ys[i] < minGap {
+            ys[i] = ys[i - 1] - minGap
+        }
+        // Keep the stack inside the canvas.
+        let overflow = graphRect.minY - (ys.last ?? graphRect.minY)
+        if overflow > 0 { for i in ys.indices { ys[i] += overflow } }
+
+        for (i, label) in placed.enumerated() {
+            let y = ys[i]
+            let dim: CGFloat = label.active ? 1.0 : 0.4
+
+            // Connector from the line's end point to the label.
+            ctx.saveGState()
+            ctx.setStrokeColor(label.color.withAlphaComponent(0.35 * dim).cgColor)
+            ctx.setLineWidth(1)
+            ctx.move(to: label.anchor)
+            ctx.addLine(to: CGPoint(x: labelX - 4, y: y))
+            ctx.strokePath()
+            ctx.restoreGState()
+
+            NSAttributedString(string: label.text, attributes: [
+                .font: font,
+                .foregroundColor: label.color.withAlphaComponent(dim)
+            ]).draw(at: CGPoint(x: labelX, y: y - lineHeight / 2))
+        }
+    }
+
+    private func drawTitle(_ text: String, at origin: CGPoint) {
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 13, weight: .semibold),
+            .foregroundColor: NSColor(calibratedRed: 1, green: 1, blue: 1, alpha: 0.75),
+            .kern: 2.0
+        ]
+        NSAttributedString(string: text, attributes: attrs)
+            .draw(at: origin)
+    }
+
+    private func drawGrid(_ ctx: CGContext, in rect: NSRect, minLatency: CGFloat, latencyRange: CGFloat) {
+        ctx.setLineWidth(1)
+        for i in 0...5 {
+            let y = rect.minY + CGFloat(i) * rect.height / 5
+            ctx.setStrokeColor(gridColor.cgColor)
+            ctx.move(to: CGPoint(x: rect.minX, y: y))
+            ctx.addLine(to: CGPoint(x: rect.maxX, y: y))
+            ctx.strokePath()
+
+            let value = Int((minLatency + latencyRange * CGFloat(i) / 5).rounded())
+            let label = NSAttributedString(string: "\(value) ms", attributes: [
+                .font: NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .regular),
+                .foregroundColor: axisTextColor
+            ])
+            let size = label.size()
+            label.draw(at: CGPoint(x: rect.minX - size.width - 8, y: y - size.height / 2))
+        }
+    }
+
+    private func drawAreaFill(_ ctx: CGContext, points: [CGPoint], baseline: CGFloat,
+                              top: CGFloat, color: NSColor, colorSpace: CGColorSpace) {
+        guard points.count >= 2 else { return }
+        ctx.saveGState()
+        let fill = CGMutablePath()
+        fill.move(to: CGPoint(x: points[0].x, y: baseline))
+        fill.addLine(to: points[0])
+        addSmoothCurve(to: fill, through: points)
+        fill.addLine(to: CGPoint(x: points.last!.x, y: baseline))
+        fill.closeSubpath()
+        ctx.addPath(fill)
+        ctx.clip()
+
+        let gradient = CGGradient(colorsSpace: colorSpace,
+                                  colors: [color.withAlphaComponent(0.40).cgColor,
+                                           color.withAlphaComponent(0.0).cgColor] as CFArray,
+                                  locations: [0, 1])!
+        ctx.drawLinearGradient(gradient,
+                               start: CGPoint(x: 0, y: top),
+                               end: CGPoint(x: 0, y: baseline),
+                               options: [])
+        ctx.restoreGState()
+    }
+
+    private func drawGlowLine(_ ctx: CGContext, points: [CGPoint], color: NSColor) {
+        guard !points.isEmpty else { return }
+        ctx.saveGState()
+        ctx.setShadow(offset: .zero, blur: 9, color: color.withAlphaComponent(0.9).cgColor)
+        ctx.setStrokeColor(color.cgColor)
+        ctx.setLineWidth(2.5)
+        ctx.setLineJoin(.round)
+        ctx.setLineCap(.round)
+        let line = CGMutablePath()
+        line.move(to: points[0])
+        addSmoothCurve(to: line, through: points)
+        ctx.addPath(line)
+        ctx.strokePath()
+        ctx.restoreGState()
+
+        if points.count == 1 {
+            drawEndDot(ctx, at: points[0], color: color)
+        }
+    }
+
+    /// Appends a Catmull-Rom spline through `points` to `path`, which must
+    /// already be positioned at `points[0]`. Produces smooth curved lines.
+    private func addSmoothCurve(to path: CGMutablePath, through points: [CGPoint]) {
+        guard points.count > 1 else { return }
+        guard points.count > 2 else {
+            path.addLine(to: points[1])
+            return
+        }
+        for i in 0..<(points.count - 1) {
+            let p0 = points[max(i - 1, 0)]
+            let p1 = points[i]
+            let p2 = points[i + 1]
+            let p3 = points[min(i + 2, points.count - 1)]
+            let c1 = CGPoint(x: p1.x + (p2.x - p0.x) / 6.0, y: p1.y + (p2.y - p0.y) / 6.0)
+            let c2 = CGPoint(x: p2.x - (p3.x - p1.x) / 6.0, y: p2.y - (p3.y - p1.y) / 6.0)
+            path.addCurve(to: p2, control1: c1, control2: c2)
+        }
+    }
+
+    private func drawEndDot(_ ctx: CGContext, at point: CGPoint, color: NSColor) {
+        ctx.saveGState()
+        ctx.setShadow(offset: .zero, blur: 12, color: color.cgColor)
+        ctx.setFillColor(color.cgColor)
+        let r: CGFloat = 4
+        ctx.fillEllipse(in: CGRect(x: point.x - r, y: point.y - r, width: r * 2, height: r * 2))
+        ctx.restoreGState()
+
+        ctx.setFillColor(NSColor.white.withAlphaComponent(0.9).cgColor)
+        ctx.fillEllipse(in: CGRect(x: point.x - 1.5, y: point.y - 1.5, width: 3, height: 3))
+    }
+
+}
+
 @MainActor
-final class DashboardController: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTableViewDelegate {
+final class DashboardController: NSObject, NSApplicationDelegate {
     private var window: NSWindow!
-    private var tableView: NSTableView!
+    private var graphView: ProbeGraphView!
     private var footerLabel: NSTextField!
     private var refreshButton: NSButton!
-    private var rows = configuredTargets.map { ProbeRow(target: $0) }
+    private var versionLabel: NSTextField!
+    private var rows: [ProbeRow] = configuredTargets.map { ProbeRow(target: $0) }
     private let engine = ProbeEngine(timeout: 3)
-    private var timer: Timer?
-    private var cycle = 0
-    private var isRunning = false
-    private let refreshInterval: TimeInterval = 5
-    private let probeInterval: TimeInterval = 0.2
+    // Each probe runs its own independent loop, so a slow target never blocks
+    // the others. `inFlight`/`scheduled` keep a single loop alive per probe.
+    private var inFlight: [Bool] = []
+    private var scheduled: [DispatchWorkItem?] = []
+    private let probeQueue = DispatchQueue(label: "probes", qos: .utility, attributes: .concurrent)
+    
+    private var buildNumber: Int {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        process.arguments = ["rev-list", "--count", "HEAD"]
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = Pipe()
+        do {
+            try process.run()
+            process.waitUntilExit()
+            let data = output.fileHandleForReading.readDataToEndOfFile()
+            if let count = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+               let intValue = Int(count) {
+                return intValue
+            }
+        } catch {
+            return 0
+        }
+        return 0
+    }
+    
+    private var versionString: String {
+        "v1.0.\(buildNumber)"
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         buildWindow()
         validateRows()
-        runCycle()
-        timer = Timer.scheduledTimer(withTimeInterval: refreshInterval, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                self?.runCycle()
-            }
+        inFlight = Array(repeating: false, count: rows.count)
+        scheduled = Array(repeating: nil, count: rows.count)
+        for index in rows.indices where rows[index].status != .configBad {
+            probeOnce(index)
         }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         true
-    }
-
-    func numberOfRows(in tableView: NSTableView) -> Int {
-        rows.count
-    }
-
-    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
-        let identifier = tableColumn?.identifier.rawValue ?? ""
-        let cell = tableView.makeView(withIdentifier: NSUserInterfaceItemIdentifier(identifier), owner: self) as? NSTextField
-            ?? NSTextField(labelWithString: "")
-        cell.identifier = NSUserInterfaceItemIdentifier(identifier)
-        cell.lineBreakMode = .byTruncatingTail
-        cell.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
-        cell.textColor = color(for: rows[row], column: identifier)
-        cell.stringValue = value(for: rows[row], column: identifier)
-        return cell
     }
 
     private func buildWindow() {
@@ -403,12 +687,24 @@ final class DashboardController: NSObject, NSApplicationDelegate, NSTableViewDat
         let title = NSTextField(labelWithString: "Operator Peering Quality")
         title.font = .systemFont(ofSize: 24, weight: .semibold)
 
+        let version = NSTextField(labelWithString: "")
+        version.font = .systemFont(ofSize: 11)
+        version.textColor = .secondaryLabelColor
+
         let subtitle = NSTextField(labelWithString: "Native macOS probe dashboard for ICMP, DNS, and HTTPS path quality.")
         subtitle.textColor = .secondaryLabelColor
 
-        let header = NSStackView(views: [title, subtitle])
+        let subtitleLine = NSStackView(views: [version, subtitle])
+        subtitleLine.orientation = .horizontal
+        subtitleLine.spacing = 8
+        subtitleLine.alignment = .centerY
+
+        let header = NSStackView(views: [title, subtitleLine])
         header.orientation = .vertical
         header.spacing = 4
+        
+        self.versionLabel = version
+        updateVersionLabel()
 
         refreshButton = NSButton(title: "Refresh Now", target: self, action: #selector(refreshNow))
         refreshButton.bezelStyle = .rounded
@@ -421,27 +717,24 @@ final class DashboardController: NSObject, NSApplicationDelegate, NSTableViewDat
         controls.alignment = .centerY
         controls.spacing = 12
 
-        tableView = NSTableView()
-        tableView.delegate = self
-        tableView.dataSource = self
-        tableView.usesAlternatingRowBackgroundColors = true
-        tableView.rowHeight = 28
-        tableView.headerView = NSTableHeaderView()
-
-        addColumn("name", "Target", 170)
-        addColumn("network", "Network", 160)
-        addColumn("scope", "Scope", 120)
-        addColumn("probe", "Probe", 90)
-        addColumn("status", "Status", 110)
-        addColumn("latency", "RTT/Time", 90)
-        addColumn("trend", "Trend", 70)
-        addColumn("success", "Success", 80)
-        addColumn("error", "Last Error", 230)
+        graphView = ProbeGraphView()
+        graphView.rows = rows
+        graphView.translatesAutoresizingMaskIntoConstraints = false
 
         let scrollView = NSScrollView()
-        scrollView.documentView = tableView
-        scrollView.hasVerticalScroller = true
+        scrollView.documentView = graphView
+        scrollView.hasVerticalScroller = false
+        scrollView.hasHorizontalScroller = false
         scrollView.borderType = .bezelBorder
+
+        // Pin the graph to fill the visible area so the dark canvas always
+        // covers the bezel and the chart scales to the window.
+        NSLayoutConstraint.activate([
+            graphView.leadingAnchor.constraint(equalTo: scrollView.contentView.leadingAnchor),
+            graphView.trailingAnchor.constraint(equalTo: scrollView.contentView.trailingAnchor),
+            graphView.topAnchor.constraint(equalTo: scrollView.contentView.topAnchor),
+            graphView.bottomAnchor.constraint(equalTo: scrollView.contentView.bottomAnchor)
+        ])
 
         root.addArrangedSubview(header)
         root.addArrangedSubview(scrollView)
@@ -459,13 +752,6 @@ final class DashboardController: NSObject, NSApplicationDelegate, NSTableViewDat
         window.makeKeyAndOrderFront(nil)
     }
 
-    private func addColumn(_ identifier: String, _ title: String, _ width: CGFloat) {
-        let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(identifier))
-        column.title = title
-        column.width = width
-        tableView.addTableColumn(column)
-    }
-
     private func validateRows() {
         for index in rows.indices {
             if let error = engine.validate(rows[index].target) {
@@ -473,130 +759,73 @@ final class DashboardController: NSObject, NSApplicationDelegate, NSTableViewDat
                 rows[index].lastError = error
             }
         }
-        tableView.reloadData()
+        graphView.needsDisplay = true
+    }
+    
+    private func updateVersionLabel() {
+        versionLabel.stringValue = versionString
     }
 
     @objc private func refreshNow() {
-        runCycle()
+        for index in rows.indices where rows[index].status != .configBad {
+            scheduled[index]?.cancel()
+            scheduled[index] = nil
+            probeOnce(index)
+        }
     }
 
-    private func runCycle() {
-        guard !isRunning else { return }
-        isRunning = true
-        cycle += 1
-        refreshButton.isEnabled = false
-        footerLabel.stringValue = "Cycle \(cycle) starting..."
+    /// Runs a single probe for one target off the main thread, then applies
+    /// the result and schedules this probe's next run — independently of every
+    /// other probe. `inFlight` guards against overlapping runs of the same one.
+    private func probeOnce(_ index: Int) {
+        guard !inFlight[index] else { return }
+        inFlight[index] = true
 
-        for index in rows.indices where rows[index].status != ProbeStatus.configBad {
-            rows[index].status = ProbeStatus.checking
-            rows[index].lastError = nil
-        }
-        tableView.reloadData()
-
-        let snapshot = rows.map { $0.target }
+        let target = rows[index].target
         let engine = self.engine
-        let probeInterval = self.probeInterval
-        let totalProbes = snapshot.count
-        let queue = DispatchQueue.global(qos: .utility)
-        let store = OutcomeCollection(count: totalProbes)
-        let group = DispatchGroup()
-        
-        for (index, target) in snapshot.enumerated() {
-            group.enter()
-            let delay = Double(index) * probeInterval
-            queue.asyncAfter(deadline: .now() + delay) {
-                let outcome = engine.run(target)
-                store.set(outcome, at: index)
-                
-                Task { @MainActor in
-                    self.updateProgress(current: index + 1, total: totalProbes)
-                }
-                
-                group.leave()
+        probeQueue.async {
+            let outcome = engine.run(target)
+            Task { @MainActor in
+                self.inFlight[index] = false
+                self.apply(outcome, at: index)
+                self.scheduleNext(index)
             }
         }
-        
-        group.notify(queue: .main) {
-            self.apply(outcomes: store.values())
-        }
-    }
-    
-    private func updateProgress(current: Int, total: Int) {
-        footerLabel.stringValue = "Cycle \(cycle): probe \(current)/\(total) running..."
-        tableView.reloadData()
     }
 
-    private func apply(outcomes: [ProbeOutcome?]) {
-        var okCount = 0
-        var badConfigCount = 0
-        var latencyTotal = 0
-        var latencyCount = 0
-
-        for index in rows.indices {
-            guard let outcome = outcomes[index] else { continue }
-
-            rows[index].totalCount += 1
-            rows[index].status = outcome.status
-            rows[index].lastError = outcome.error
-
-            if outcome.status == ProbeStatus.ok {
-                rows[index].successCount += 1
-                rows[index].previousLatencyMs = rows[index].latencyMs
-                rows[index].latencyMs = outcome.latencyMs
-                okCount += 1
-
-                if let latency = outcome.latencyMs {
-                    latencyTotal += latency
-                    latencyCount += 1
-                }
-            } else {
-                if outcome.status == ProbeStatus.configBad {
-                    badConfigCount += 1
-                }
-                rows[index].latencyMs = nil
-            }
-        }
-
-        let avg = latencyCount > 0 ? "\(latencyTotal / latencyCount) ms avg" : "no latency samples"
-        footerLabel.stringValue = "Cycle \(cycle): \(okCount)/\(rows.count) probes OK, \(badConfigCount) config bad, \(avg). Next refresh in \(Int(refreshInterval))s."
-        refreshButton.isEnabled = true
-        isRunning = false
-        tableView.reloadData()
+    private func scheduleNext(_ index: Int) {
+        scheduled[index]?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.probeOnce(index) }
+        scheduled[index] = work
+        let interval = rows[index].target.probe.refreshInterval
+        DispatchQueue.main.asyncAfter(deadline: .now() + interval, execute: work)
     }
 
-    private func value(for row: ProbeRow, column: String) -> String {
-        switch column {
-        case "name": row.target.name
-        case "network": row.target.network
-        case "scope": row.target.scope
-        case "probe": row.target.probe.label
-        case "status": row.status.rawValue
-        case "latency": row.latencyText
-        case "trend": row.trend
-        case "success": row.successRate
-        case "error": row.lastError ?? ""
-        default: ""
+    private func apply(_ outcome: ProbeOutcome, at index: Int) {
+        rows[index].totalCount += 1
+        rows[index].status = outcome.status
+        rows[index].lastError = outcome.error
+        rows[index].addLatency(outcome.latencyMs)
+
+        if outcome.status == .ok {
+            rows[index].successCount += 1
+            rows[index].previousLatencyMs = rows[index].latencyMs
+            rows[index].latencyMs = outcome.latencyMs
+        } else {
+            rows[index].latencyMs = nil
         }
+
+        graphView.rows = rows
+        graphView.needsDisplay = true
+        updateFooter()
     }
 
-    private func color(for row: ProbeRow, column: String) -> NSColor {
-        if column == "status" {
-            switch row.status {
-            case .ok: return .systemGreen
-            case .checking: return .systemBlue
-            case .configBad: return .systemOrange
-            case .failed: return .systemRed
-            case .pending: return .secondaryLabelColor
-            }
-        }
-
-        if column == "latency", let latency = row.latencyMs {
-            if latency < 50 { return .systemGreen }
-            if latency < 150 { return .systemOrange }
-            return .systemRed
-        }
-
-        return .labelColor
+    private func updateFooter() {
+        let ok = rows.filter { $0.status == .ok }.count
+        let bad = rows.filter { $0.status == .configBad }.count
+        let latencies = rows.compactMap { $0.latencyMs }
+        let avg = latencies.isEmpty ? "no latency samples" : "\(latencies.reduce(0, +) / latencies.count) ms avg"
+        footerLabel.stringValue = "\(ok)/\(rows.count) probes OK, \(bad) config bad, \(avg)."
     }
 }
 

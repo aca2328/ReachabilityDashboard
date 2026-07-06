@@ -14,6 +14,10 @@ let package = Package(
         .executableTarget(
             name: "ReachabilityDashboard",
             path: "Sources/ReachabilityDashboard"
+        ),
+        .testTarget(
+            name: "ReachabilityDashboardTests",
+            dependencies: ["ReachabilityDashboard"]
         )
     ]
 )
