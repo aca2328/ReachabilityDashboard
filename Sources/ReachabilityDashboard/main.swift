@@ -62,8 +62,13 @@ struct ProbeRow {
     var totalCount = 0
     var lastError: String?
     var latencyHistory: [Int?] = []
-    
-    static let maxHistoryPoints = 50
+    // Tracks the flat run of repeated samples since the last real probe
+    // result, so a fresh result can smooth that run into a ramp instead of
+    // leaving a sudden step.
+    var lastRealValue: Int?
+    var ticksSinceRealValue = 0
+
+    static let maxHistoryPoints = 250
 
     var successRate: String {
         guard totalCount > 0 else { return "-" }
@@ -87,6 +92,26 @@ struct ProbeRow {
         latencyHistory.append(latency)
         if latencyHistory.count > ProbeRow.maxHistoryPoints {
             latencyHistory.removeFirst()
+        }
+        ticksSinceRealValue += 1
+    }
+
+    /// Called when a probe actually completes. Retroactively replaces the run
+    /// of flat repeated samples since the last real result with a linear ramp
+    /// toward the new value, so the graph shows a smooth transition rather
+    /// than holding flat and then jumping.
+    mutating func applyRealValue(_ newValue: Int?) {
+        defer {
+            lastRealValue = newValue
+            ticksSinceRealValue = 0
+        }
+        guard let previous = lastRealValue, let new = newValue else { return }
+        let runLength = min(ticksSinceRealValue, latencyHistory.count)
+        guard runLength > 0 else { return }
+        let start = latencyHistory.count - runLength
+        for offset in 0..<runLength {
+            let t = Double(offset + 1) / Double(runLength + 1)
+            latencyHistory[start + offset] = Int((Double(previous) + (Double(new) - Double(previous)) * t).rounded())
         }
     }
 }
@@ -628,7 +653,13 @@ final class DashboardController: NSObject, NSApplicationDelegate {
     private var inFlight: [Bool] = []
     private var scheduled: [DispatchWorkItem?] = []
     private let probeQueue = DispatchQueue(label: "probes", qos: .utility, attributes: .concurrent)
-    
+    // Probes complete at different, unpredictable moments (each has its own
+    // refresh interval and network latency), so history is sampled on a
+    // separate fixed-cadence timer rather than appended when a probe finishes.
+    // This keeps every row's points evenly spaced on the same time axis.
+    private var graphTickTimer: Timer?
+    private let graphTickInterval: TimeInterval = 0.2
+
     private var buildNumber: Int {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
@@ -661,6 +692,9 @@ final class DashboardController: NSObject, NSApplicationDelegate {
         scheduled = Array(repeating: nil, count: rows.count)
         for index in rows.indices where rows[index].status != .configBad {
             probeOnce(index)
+        }
+        graphTickTimer = Timer.scheduledTimer(withTimeInterval: graphTickInterval, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.tickGraph() }
         }
     }
 
@@ -801,11 +835,21 @@ final class DashboardController: NSObject, NSApplicationDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + interval, execute: work)
     }
 
+    /// Samples every row's current latency onto the graph at a fixed cadence,
+    /// independent of when each probe actually completed. A probe that hasn't
+    /// finished since the last tick just repeats its last known value.
+    private func tickGraph() {
+        for index in rows.indices where rows[index].status != .configBad {
+            rows[index].addLatency(rows[index].latencyMs)
+        }
+        graphView.rows = rows
+        graphView.needsDisplay = true
+    }
+
     private func apply(_ outcome: ProbeOutcome, at index: Int) {
         rows[index].totalCount += 1
         rows[index].status = outcome.status
         rows[index].lastError = outcome.error
-        rows[index].addLatency(outcome.latencyMs)
 
         if outcome.status == .ok {
             rows[index].successCount += 1
@@ -814,6 +858,7 @@ final class DashboardController: NSObject, NSApplicationDelegate {
         } else {
             rows[index].latencyMs = nil
         }
+        rows[index].applyRealValue(rows[index].latencyMs)
 
         graphView.rows = rows
         graphView.needsDisplay = true
