@@ -9,7 +9,7 @@
 
 set -e
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="${0:A:h}"
 cd "$SCRIPT_DIR"
 
 echo "🔄 Pulling latest changes..."
@@ -22,6 +22,6 @@ echo "🔨 Building in release mode..."
 swift build --configuration release
 
 echo "▶️  Running application..."
-open .build/arm64-apple-macosx/release/ReachabilityDashboard
+open "$(swift build --configuration release --show-bin-path)/ReachabilityDashboard"
 
 echo "✅ Application started. Check your Dock."
