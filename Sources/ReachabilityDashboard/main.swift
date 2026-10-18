@@ -61,14 +61,10 @@ struct ProbeRow {
     var successCount = 0
     var totalCount = 0
     var lastError: String?
-    var latencyHistory: [Int?] = []
-    // Tracks the flat run of repeated samples since the last real probe
-    // result, so a fresh result can smooth that run into a ramp instead of
-    // leaving a sudden step.
-    var lastRealValue: Int?
-    var ticksSinceRealValue = 0
-
-    static let maxHistoryPoints = 250
+    // Timestamped probe results (nil latency = failed probe), oldest first.
+    // The graph positions points by time, so rows with different refresh
+    // intervals share one continuously scrolling time axis.
+    var samples: [(time: TimeInterval, latency: Int?)] = []
 
     var successRate: String {
         guard totalCount > 0 else { return "-" }
@@ -88,30 +84,15 @@ struct ProbeRow {
         return "flat"
     }
     
-    mutating func addLatency(_ latency: Int?) {
-        latencyHistory.append(latency)
-        if latencyHistory.count > ProbeRow.maxHistoryPoints {
-            latencyHistory.removeFirst()
-        }
-        ticksSinceRealValue += 1
+    mutating func addSample(_ latency: Int?, at time: TimeInterval) {
+        samples.append((time, latency))
     }
 
-    /// Called when a probe actually completes. Retroactively replaces the run
-    /// of flat repeated samples since the last real result with a linear ramp
-    /// toward the new value, so the graph shows a smooth transition rather
-    /// than holding flat and then jumping.
-    mutating func applyRealValue(_ newValue: Int?) {
-        defer {
-            lastRealValue = newValue
-            ticksSinceRealValue = 0
-        }
-        guard let previous = lastRealValue, let new = newValue else { return }
-        let runLength = min(ticksSinceRealValue, latencyHistory.count)
-        guard runLength > 0 else { return }
-        let start = latencyHistory.count - runLength
-        for offset in 0..<runLength {
-            let t = Double(offset + 1) / Double(runLength + 1)
-            latencyHistory[start + offset] = Int((Double(previous) + (Double(new) - Double(previous)) * t).rounded())
+    /// Drops samples older than `cutoff`, keeping one just before it so the
+    /// line slides in from the left edge instead of popping into view.
+    mutating func pruneSamples(before cutoff: TimeInterval) {
+        while samples.count > 1, samples[1].time < cutoff {
+            samples.removeFirst()
         }
     }
 }
@@ -376,6 +357,16 @@ final class ProbeEngine: @unchecked Sendable {
 
 final class ProbeGraphView: NSView {
     var rows: [ProbeRow] = []
+    /// Current time (system uptime); advanced every frame so lines scroll
+    /// continuously rather than stepping when a sample arrives.
+    var now: TimeInterval = ProcessInfo.processInfo.systemUptime
+
+    /// Seconds of history visible across the graph's width.
+    static let visibleWindow: TimeInterval = 60
+    /// The right edge shows the state from this many seconds ago — a bit more
+    /// than the slowest probe cadence (DNS_AUTH, 3s) — so the newest stretch of
+    /// line is almost always between two known samples and never reshapes.
+    static let displayDelay: TimeInterval = 4
 
     private let colors: [NSColor] = [
         .systemRed, .systemBlue, .systemGreen, .systemOrange, .systemPurple,
@@ -414,19 +405,21 @@ final class ProbeGraphView: NSView {
 
         drawTitle("LATENCY OVER TIME", at: CGPoint(x: leftPad, y: bounds.maxY - 32))
 
-        let allLatencies = rows.flatMap { $0.latencyHistory.compactMap { $0 } }
+        let span = ProbeGraphView.visibleWindow
+        let headTime = now - ProbeGraphView.displayDelay
+        let startTime = headTime - span
+
+        let allLatencies = rows.flatMap { row in
+            row.samples.filter { $0.time >= startTime && $0.time <= headTime }.compactMap { $0.latency }
+        }
         let rawMax = allLatencies.max() ?? 100
         let rawMin = allLatencies.min() ?? 0
         let maxLatency = CGFloat(rawMax) + CGFloat(max(rawMax - rawMin, 10)) * 0.12
         let minLatency = max(0, CGFloat(rawMin) - CGFloat(max(rawMax - rawMin, 10)) * 0.05)
         let latencyRange = max(maxLatency - minLatency, 1)
 
-        let pointCount = rows.map { $0.latencyHistory.count }.max() ?? 0
-        let xDenom = CGFloat(max(pointCount - 1, 1))
-        let xScale = graphRect.width / xDenom
-
-        func point(_ index: Int, _ value: Int) -> CGPoint {
-            let x = graphRect.minX + CGFloat(index) * xScale
+        func point(_ time: TimeInterval, _ value: Int) -> CGPoint {
+            let x = graphRect.maxX - CGFloat((headTime - time) / span) * graphRect.width
             let y = graphRect.minY + (CGFloat(value) - minLatency) / latencyRange * graphRect.height
             return CGPoint(x: x, y: y)
         }
@@ -437,19 +430,28 @@ final class ProbeGraphView: NSView {
 
         var labels: [FloatingLabel] = []
 
+        // Lines extend past both edges of the plot (older samples on the left,
+        // samples newer than headTime on the right); clip them horizontally.
+        ctx.saveGState()
+        ctx.clip(to: NSRect(x: graphRect.minX, y: bounds.minY, width: graphRect.width, height: bounds.height))
+
         for (rowIndex, row) in rows.enumerated() {
             let color = colors[rowIndex % colors.count]
             // Split into contiguous segments so failed probes break the line
             // instead of plunging it to the floor.
             var segments: [[CGPoint]] = []
             var current: [CGPoint] = []
-            for (i, latency) in row.latencyHistory.enumerated() {
-                if let latency {
-                    current.append(point(i, latency))
+            for sample in row.samples {
+                if let latency = sample.latency {
+                    current.append(point(sample.time, latency))
                 } else if !current.isEmpty {
                     segments.append(current)
                     current = []
                 }
+            }
+            // A late probe holds its last value flat up to the right edge.
+            if let last = row.samples.last, let latency = last.latency, last.time < headTime {
+                current.append(point(headTime, latency))
             }
             if !current.isEmpty { segments.append(current) }
             guard !segments.isEmpty else { continue }
@@ -460,11 +462,19 @@ final class ProbeGraphView: NSView {
                 drawGlowLine(ctx, points: pts, color: color)
             }
 
-            if let end = segments.last?.last {
-                drawEndDot(ctx, at: end, color: color)
-                labels.append(FloatingLabel(text: labelText(for: row), color: color,
-                                            anchor: end, active: row.status == .ok))
-            }
+            // The line's visible end: where it crosses the right edge, or where
+            // its last segment stops if the probe has been failing since.
+            guard let segment = segments.last(where: { $0[0].x <= graphRect.maxX }),
+                  let end = curvePoint(on: segment, atX: graphRect.maxX) ?? segment.last(where: { $0.x <= graphRect.maxX }),
+                  end.x >= graphRect.minX else { continue }
+            labels.append(FloatingLabel(text: labelText(for: row), color: color,
+                                        anchor: end, active: row.status == .ok))
+        }
+
+        ctx.restoreGState()
+
+        for label in labels {
+            drawEndDot(ctx, at: label.anchor, color: label.color)
         }
 
         drawFloatingLabels(ctx, labels, graphRect: graphRect)
@@ -613,14 +623,41 @@ final class ProbeGraphView: NSView {
             return
         }
         for i in 0..<(points.count - 1) {
-            let p0 = points[max(i - 1, 0)]
-            let p1 = points[i]
-            let p2 = points[i + 1]
-            let p3 = points[min(i + 2, points.count - 1)]
-            let c1 = CGPoint(x: p1.x + (p2.x - p0.x) / 6.0, y: p1.y + (p2.y - p0.y) / 6.0)
-            let c2 = CGPoint(x: p2.x - (p3.x - p1.x) / 6.0, y: p2.y - (p3.y - p1.y) / 6.0)
-            path.addCurve(to: p2, control1: c1, control2: c2)
+            let (c1, c2) = controlPoints(points, segment: i)
+            path.addCurve(to: points[i + 1], control1: c1, control2: c2)
         }
+    }
+
+    /// Bezier control points of the Catmull-Rom segment from points[i] to points[i + 1].
+    private func controlPoints(_ points: [CGPoint], segment i: Int) -> (CGPoint, CGPoint) {
+        let p0 = points[max(i - 1, 0)]
+        let p1 = points[i]
+        let p2 = points[i + 1]
+        let p3 = points[min(i + 2, points.count - 1)]
+        let c1 = CGPoint(x: p1.x + (p2.x - p0.x) / 6.0, y: p1.y + (p2.y - p0.y) / 6.0)
+        let c2 = CGPoint(x: p2.x - (p3.x - p1.x) / 6.0, y: p2.y - (p3.y - p1.y) / 6.0)
+        return (c1, c2)
+    }
+
+    /// The point where the smooth curve through `points` crosses `x`, so the
+    /// end dot sits exactly on the drawn line. Nil if the curve doesn't span `x`.
+    private func curvePoint(on points: [CGPoint], atX x: CGFloat) -> CGPoint? {
+        guard points.count >= 2,
+              let i = points.indices.dropLast().first(where: { points[$0].x <= x && x <= points[$0 + 1].x })
+        else { return nil }
+        let p1 = points[i]
+        let p2 = points[i + 1]
+        guard points.count > 2 else {
+            let t = p2.x > p1.x ? (x - p1.x) / (p2.x - p1.x) : 1
+            return CGPoint(x: x, y: p1.y + (p2.y - p1.y) * t)
+        }
+        let (c1, c2) = controlPoints(points, segment: i)
+        // x(t) is close to linear for evenly spaced samples, so use the x
+        // fraction as the curve parameter.
+        let t = p2.x > p1.x ? (x - p1.x) / (p2.x - p1.x) : 1
+        let u = 1 - t
+        let y = u * u * u * p1.y + 3 * u * u * t * c1.y + 3 * u * t * t * c2.y + t * t * t * p2.y
+        return CGPoint(x: x, y: y)
     }
 
     private func drawEndDot(_ ctx: CGContext, at point: CGPoint, color: NSColor) {
@@ -651,12 +688,15 @@ final class DashboardController: NSObject, NSApplicationDelegate {
     private var inFlight: [Bool] = []
     private var scheduled: [DispatchWorkItem?] = []
     private let probeQueue = DispatchQueue(label: "probes", qos: .utility, attributes: .concurrent)
-    // Probes complete at different, unpredictable moments (each has its own
-    // refresh interval and network latency), so history is sampled on a
-    // separate fixed-cadence timer rather than appended when a probe finishes.
-    // This keeps every row's points evenly spaced on the same time axis.
-    private var graphTickTimer: Timer?
-    private let graphTickInterval: TimeInterval = 0.2
+    // Redraws the graph every frame so it scrolls continuously; samples are
+    // only recorded when a probe completes.
+    private var frameTimer: Timer?
+    // Menu bar presence: the app has no Dock icon and lives here instead.
+    private var statusItem: NSStatusItem!
+    private let popover = NSPopover()
+    private var popoverDots: [NSTextField] = []
+    private var popoverLatencies: [NSTextField] = []
+    private var popoverSummary: NSTextField!
 
     private var buildNumber: Int {
         // Inside a .app bundle (built by bundle.sh) the working directory isn't
@@ -691,19 +731,25 @@ final class DashboardController: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         buildWindow()
+        buildStatusItem()
         validateRows()
         inFlight = Array(repeating: false, count: rows.count)
         scheduled = Array(repeating: nil, count: rows.count)
         for index in rows.indices where rows[index].status != .configBad {
             probeOnce(index)
         }
-        graphTickTimer = Timer.scheduledTimer(withTimeInterval: graphTickInterval, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.tickGraph() }
+        // .common mode keeps frames coming during live resize; assumeIsolated
+        // (not a Task per frame) avoids scheduling jitter.
+        let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.renderFrame() }
         }
+        RunLoop.main.add(timer, forMode: .common)
+        frameTimer = timer
     }
 
+    // Closing the window just hides it; the app keeps probing in the menu bar.
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        true
+        false
     }
 
     private func buildWindow() {
@@ -714,6 +760,7 @@ final class DashboardController: NSObject, NSApplicationDelegate {
             defer: false
         )
         window.title = "Operator Peering Quality Dashboard"
+        window.isReleasedWhenClosed = false
         window.center()
 
         let root = NSStackView()
@@ -756,6 +803,7 @@ final class DashboardController: NSObject, NSApplicationDelegate {
         controls.spacing = 12
 
         graphView = ProbeGraphView()
+        graphView.wantsLayer = true
         graphView.rows = rows
         graphView.translatesAutoresizingMaskIntoConstraints = false
 
@@ -798,6 +846,7 @@ final class DashboardController: NSObject, NSApplicationDelegate {
             }
         }
         graphView.needsDisplay = true
+        updateStatusItem()
     }
     
     private func updateVersionLabel() {
@@ -839,14 +888,11 @@ final class DashboardController: NSObject, NSApplicationDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + interval, execute: work)
     }
 
-    /// Samples every row's current latency onto the graph at a fixed cadence,
-    /// independent of when each probe actually completed. A probe that hasn't
-    /// finished since the last tick just repeats its last known value.
-    private func tickGraph() {
-        for index in rows.indices where rows[index].status != .configBad {
-            rows[index].addLatency(rows[index].latencyMs)
-        }
-        graphView.rows = rows
+    /// Advances the graph's clock and redraws it — only while the window is
+    /// actually on screen, so the menu-bar-only state stays near idle.
+    private func renderFrame() {
+        guard window.isVisible, window.occlusionState.contains(.visible) else { return }
+        graphView.now = ProcessInfo.processInfo.systemUptime
         graphView.needsDisplay = true
     }
 
@@ -862,11 +908,120 @@ final class DashboardController: NSObject, NSApplicationDelegate {
         } else {
             rows[index].latencyMs = nil
         }
-        rows[index].applyRealValue(rows[index].latencyMs)
+        let now = ProcessInfo.processInfo.systemUptime
+        rows[index].addSample(rows[index].latencyMs, at: now)
+        rows[index].pruneSamples(before: now - ProbeGraphView.displayDelay - ProbeGraphView.visibleWindow)
 
         graphView.rows = rows
-        graphView.needsDisplay = true
         updateFooter()
+        updateStatusItem()
+    }
+
+    private func buildStatusItem() {
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        statusItem.button?.target = self
+        statusItem.button?.action = #selector(togglePopover)
+
+        let title = NSTextField(labelWithString: "Operator Peering Quality")
+        title.font = .systemFont(ofSize: 13, weight: .semibold)
+
+        popoverSummary = NSTextField(labelWithString: "Starting...")
+        popoverSummary.font = .systemFont(ofSize: 11)
+        popoverSummary.textColor = .secondaryLabelColor
+
+        let grid = NSGridView()
+        grid.rowSpacing = 4
+        grid.columnSpacing = 8
+        for row in rows {
+            let dot = NSTextField(labelWithString: "●")
+            let name = NSTextField(labelWithString: row.target.name)
+            let latency = NSTextField(labelWithString: "-")
+            latency.font = .monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
+            latency.alignment = .right
+            grid.addRow(with: [dot, name, latency])
+            popoverDots.append(dot)
+            popoverLatencies.append(latency)
+        }
+        grid.column(at: 2).xPlacement = .trailing
+
+        let openButton = NSButton(title: "Open Dashboard", target: self, action: #selector(openDashboard))
+        openButton.bezelStyle = .rounded
+        openButton.keyEquivalent = "\r"
+        let quitButton = NSButton(title: "Quit", target: self, action: #selector(quit))
+        quitButton.bezelStyle = .rounded
+        let buttons = NSStackView(views: [quitButton, NSView(), openButton])
+        buttons.orientation = .horizontal
+
+        let stack = NSStackView(views: [title, popoverSummary, grid, buttons])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 10
+        stack.edgeInsets = NSEdgeInsets(top: 14, left: 14, bottom: 14, right: 14)
+        buttons.widthAnchor.constraint(equalTo: grid.widthAnchor).isActive = true
+
+        let content = NSViewController()
+        content.view = stack
+        popover.contentViewController = content
+        popover.behavior = .transient
+
+        updateStatusItem()
+    }
+
+    /// Recolors the menu bar icon by overall health and refreshes the popover:
+    /// green = all probes OK, orange = some failing, red = all failing,
+    /// gray = no results yet.
+    private func updateStatusItem() {
+        guard statusItem != nil else { return }
+        let active = rows.filter { $0.status != .configBad }
+        let ok = active.filter { $0.status == .ok }.count
+        let failed = active.filter { $0.status == .failed }.count
+        let health: NSColor
+        if ok + failed == 0 {
+            health = .systemGray
+        } else if failed == 0 {
+            health = .systemGreen
+        } else if ok == 0 {
+            health = .systemRed
+        } else {
+            health = .systemOrange
+        }
+        let config = NSImage.SymbolConfiguration(pointSize: 14, weight: .medium)
+            .applying(NSImage.SymbolConfiguration(paletteColors: [health]))
+        statusItem.button?.image = NSImage(systemSymbolName: "antenna.radiowaves.left.and.right",
+                                           accessibilityDescription: "Reachability")?
+            .withSymbolConfiguration(config)
+
+        popoverSummary.stringValue = footerLabel.stringValue
+        for (index, row) in rows.enumerated() where index < popoverDots.count {
+            popoverDots[index].textColor = switch row.status {
+            case .ok: .systemGreen
+            case .failed: .systemRed
+            case .configBad: .systemGray
+            case .pending, .checking: .tertiaryLabelColor
+            }
+            popoverLatencies[index].stringValue = row.status == .configBad ? "config bad" : row.latencyText
+        }
+    }
+
+    @objc private func togglePopover() {
+        if popover.isShown {
+            popover.performClose(nil)
+        } else if let button = statusItem.button {
+            // An accessory app must be active for the transient popover to
+            // close when the user clicks elsewhere.
+            NSApp.activate(ignoringOtherApps: true)
+            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        }
+    }
+
+    @objc private func openDashboard() {
+        popover.performClose(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+    }
+
+    @objc private func quit() {
+        NSApp.terminate(nil)
     }
 
     private func updateFooter() {
@@ -881,6 +1036,6 @@ final class DashboardController: NSObject, NSApplicationDelegate {
 let app = NSApplication.shared
 let delegate = DashboardController()
 app.delegate = delegate
-app.setActivationPolicy(.regular)
+app.setActivationPolicy(.accessory)
 app.activate(ignoringOtherApps: true)
 app.run()

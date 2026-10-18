@@ -43,6 +43,8 @@ cat > "$APP_DIR/Contents/Info.plist" <<EOF
     <string>$BUILD_NUMBER</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
+    <key>LSUIElement</key>
+    <true/>
     <key>NSHighResolutionCapable</key>
     <true/>
 </dict>
