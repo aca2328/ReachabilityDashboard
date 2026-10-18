@@ -136,10 +136,8 @@ let configuredTargets: [ProbeTarget] = [
     .init(name: "K-root RIPE NCC", host: "193.0.14.129", network: "AS25152 / root", scope: "anycast-root", probe: .dnsAuth),
     .init(name: "M-root WIDE", host: "202.12.27.33", network: "WIDE / root", scope: "anycast-root", probe: .dnsAuth),
     .init(name: "Cloudflare HTTPS", host: "www.cloudflare.com", network: "AS13335 / CDN", scope: "global", probe: .httpsConnect),
-    .init(name: "Wikipedia HTTPS", host: "www.wikipedia.org", network: "AS14907 / CDN", scope: "global", probe: .httpsGet),
     .init(name: "Deutsche Telekom", host: "194.25.0.60", network: "AS3320 / DE", scope: "operator", probe: .icmpEcho),
     .init(name: "Hurricane Electric", host: "184.105.213.138", network: "AS6939 / US", scope: "operator", probe: .icmpEcho),
-    .init(name: "Telstra", host: "139.130.4.5", network: "AS1221 / AU", scope: "operator", probe: .icmpEcho),
     .init(name: "LACNIC", host: "200.3.14.1", network: "AS28001 / UY", scope: "operator", probe: .icmpEcho)
 ]
 

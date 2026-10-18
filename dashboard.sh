@@ -16,10 +16,8 @@ TARGETS=(
     "K-root RIPE NCC|193.0.14.129|AS25152 / root|anycast-root|DNS_AUTH"
     "M-root WIDE|202.12.27.33|WIDE / root|anycast-root|DNS_AUTH"
     "Cloudflare HTTPS|www.cloudflare.com|AS13335 / CDN|global|HTTPS_CONNECT"
-    "Wikipedia HTTPS|www.wikipedia.org|AS14907 / CDN|global|HTTPS_GET"
     "Deutsche Telekom|194.25.0.60|AS3320 / DE|operator|ICMP_ECHO"
     "Hurricane Electric|184.105.213.138|AS6939 / US|operator|ICMP_ECHO"
-    "Telstra|139.130.4.5|AS1221 / AU|operator|ICMP_ECHO"
     "LACNIC|200.3.14.1|AS28001 / UY|operator|ICMP_ECHO"
 )
 
