@@ -659,6 +659,12 @@ final class DashboardController: NSObject, NSApplicationDelegate {
     private let graphTickInterval: TimeInterval = 0.2
 
     private var buildNumber: Int {
+        // Inside a .app bundle (built by bundle.sh) the working directory isn't
+        // the repo, so the git count is baked into Info.plist at bundle time.
+        if let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String,
+           let intValue = Int(version) {
+            return intValue
+        }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
         process.arguments = ["rev-list", "--count", "HEAD"]

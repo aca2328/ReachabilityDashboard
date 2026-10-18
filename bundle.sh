@@ -1,0 +1,56 @@
+#!/bin/zsh
+
+# Build script that packages ReachabilityDashboard as a macOS .app bundle
+# This script:
+# 1. Builds the project in release mode
+# 2. Wraps the binary in .build/ReachabilityDashboard.app
+# 3. Bakes the git commit count into Info.plist as the build number
+# 4. Ad-hoc signs the bundle
+
+set -e
+
+SCRIPT_DIR="${0:A:h}"
+cd "$SCRIPT_DIR"
+
+APP_NAME="ReachabilityDashboard"
+APP_DIR=".build/$APP_NAME.app"
+BUILD_NUMBER="$(git rev-list --count HEAD)"
+
+echo "🔨 Building in release mode..."
+swift build --configuration release
+
+echo "📦 Creating $APP_DIR..."
+rm -rf "$APP_DIR"
+mkdir -p "$APP_DIR/Contents/MacOS"
+cp "$(swift build --configuration release --show-bin-path)/$APP_NAME" "$APP_DIR/Contents/MacOS/$APP_NAME"
+
+cat > "$APP_DIR/Contents/Info.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleExecutable</key>
+    <string>$APP_NAME</string>
+    <key>CFBundleIdentifier</key>
+    <string>org.camerlo.$APP_NAME</string>
+    <key>CFBundleName</key>
+    <string>$APP_NAME</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0.$BUILD_NUMBER</string>
+    <key>CFBundleVersion</key>
+    <string>$BUILD_NUMBER</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>13.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+</dict>
+</plist>
+EOF
+
+echo "🔏 Signing..."
+codesign --force --sign - "$APP_DIR"
+
+echo "✅ Built $SCRIPT_DIR/$APP_DIR"
+echo "   Run: open $APP_DIR    Install: cp -R $APP_DIR /Applications/"
