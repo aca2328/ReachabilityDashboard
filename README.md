@@ -12,7 +12,15 @@ Native macOS menu bar app for monitoring operator peering quality with ICMP, DNS
 
 ## Install
 
-Build a signed `.app` bundle (with icon) and copy it to Applications:
+Download `ReachabilityDashboard.zip` from the [latest release](https://github.com/aca2328/ReachabilityDashboard/releases/latest), unzip it, and move `ReachabilityDashboard.app` to Applications. It runs on macOS 13 or later, on Apple silicon and Intel Macs.
+
+The app is ad-hoc signed, not notarized, so macOS blocks it the first time. Either open it once, then choose **Open Anyway** in System Settings › Privacy & Security, or clear the download flag in Terminal:
+
+```sh
+xattr -dr com.apple.quarantine /Applications/ReachabilityDashboard.app
+```
+
+To build it yourself instead, create a signed universal `.app` bundle (with icon) and copy it to Applications:
 
 ```sh
 ./bundle.sh
