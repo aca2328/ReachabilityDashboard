@@ -380,6 +380,36 @@ final class ProbeEngine: @unchecked Sendable {
     }
 }
 
+/// A y-axis range that eases toward its target each frame instead of
+/// snapping. Shared by the main graph and the popover sparklines.
+struct EasedRange {
+    private var shownMin: CGFloat?
+    private var shownMax: CGFloat?
+    private var lastTime: TimeInterval?
+
+    mutating func update(min targetMin: CGFloat, max targetMax: CGFloat, at now: TimeInterval) -> (CGFloat, CGFloat) {
+        let dt = lastTime.map { now - $0 } ?? .infinity
+        lastTime = now
+        // First frame, or the view was hidden for a while: jump straight there.
+        guard let currentMin = shownMin, let currentMax = shownMax, dt < 1 else {
+            shownMin = targetMin
+            shownMax = targetMax
+            return (targetMin, targetMax)
+        }
+        // Expand fast so a new peak stays on the canvas; contract slowly so
+        // the axis doesn't pump as small spikes come and go.
+        func step(_ current: CGFloat, toward target: CGFloat, expanding: Bool) -> CGFloat {
+            let timeConstant: TimeInterval = expanding ? 0.15 : 0.8
+            return current + (target - current) * CGFloat(1 - exp(-dt / timeConstant))
+        }
+        let newMin = step(currentMin, toward: targetMin, expanding: targetMin < currentMin)
+        let newMax = step(currentMax, toward: targetMax, expanding: targetMax > currentMax)
+        shownMin = newMin
+        shownMax = newMax
+        return (newMin, newMax)
+    }
+}
+
 final class ProbeGraphView: NSView {
     var rows: [ProbeRow] = []
     /// Current time (system uptime); advanced every frame so lines scroll
@@ -392,6 +422,10 @@ final class ProbeGraphView: NSView {
     /// than the slowest probe cadence (DNS_AUTH, 3s) — so the newest stretch of
     /// line is almost always between two known samples and never reshapes.
     static let displayDelay: TimeInterval = 4
+
+    // Displayed y-range, eased so the axis glides instead of snapping when a
+    // spike enters or scrolls off.
+    private var yRange = EasedRange()
 
     static let colors: [NSColor] = [
         .systemRed, .systemBlue, .systemGreen, .systemOrange, .systemPurple,
@@ -432,15 +466,20 @@ final class ProbeGraphView: NSView {
 
         let span = ProbeGraphView.visibleWindow
         let headTime = now - ProbeGraphView.displayDelay
-        let startTime = headTime - span
 
-        let allLatencies = rows.flatMap { row in
-            row.samples.filter { $0.time >= startTime && $0.time <= headTime }.compactMap { $0.latency }
-        }
+        // Range over every stored sample, not just the visible ones: samples
+        // newer than headTime are known ~displayDelay before the line reaches
+        // them, so the eased range finishes expanding before a peak scrolls
+        // in; and pruning keeps only ~one sample past the left edge, whose
+        // curve is still partly on screen. Either way, no overshoot.
+        let allLatencies = rows.flatMap { row in row.samples.compactMap { $0.latency } }
         let rawMax = allLatencies.max() ?? 100
         let rawMin = allLatencies.min() ?? 0
-        let maxLatency = CGFloat(rawMax) + CGFloat(max(rawMax - rawMin, 10)) * 0.12
-        let minLatency = max(0, CGFloat(rawMin) - CGFloat(max(rawMax - rawMin, 10)) * 0.05)
+        let (minLatency, maxLatency) = yRange.update(
+            min: max(0, CGFloat(rawMin) - CGFloat(max(rawMax - rawMin, 10)) * 0.05),
+            max: CGFloat(rawMax) + CGFloat(max(rawMax - rawMin, 10)) * 0.12,
+            at: now
+        )
         let latencyRange = max(maxLatency - minLatency, 1)
 
         func point(_ time: TimeInterval, _ value: Int) -> CGPoint {
@@ -706,6 +745,7 @@ final class SparklineView: NSView {
     var samples: [(time: TimeInterval, latency: Int?)] = []
     var now: TimeInterval = ProcessInfo.processInfo.systemUptime
     var color: NSColor = .systemBlue
+    private var yRange = EasedRange()
 
     override var intrinsicContentSize: NSSize { NSSize(width: 120, height: 22) }
 
@@ -715,10 +755,16 @@ final class SparklineView: NSView {
         let span = ProbeGraphView.visibleWindow
         let headTime = now - ProbeGraphView.displayDelay
 
-        let visible = samples.filter { $0.time >= headTime - span && $0.time <= headTime }.compactMap { $0.latency }
-        guard let rawMin = visible.min(), let rawMax = visible.max() else { return }
-        let minLatency = CGFloat(rawMin)
-        let range = CGFloat(max(rawMax - rawMin, 4))
+        // Range over every stored sample, as in ProbeGraphView, so peaks never
+        // overshoot the view at either edge.
+        let latencies = samples.compactMap { $0.latency }
+        guard let rawMin = latencies.min(), let rawMax = latencies.max() else { return }
+        let (minLatency, maxLatency) = yRange.update(
+            min: CGFloat(rawMin),
+            max: CGFloat(rawMin + max(rawMax - rawMin, 4)),
+            at: now
+        )
+        let range = max(maxLatency - minLatency, 1)
 
         func point(_ time: TimeInterval, _ value: Int) -> CGPoint {
             CGPoint(x: rect.maxX - CGFloat((headTime - time) / span) * rect.width,
