@@ -1,7 +1,7 @@
 import AppKit
 import Foundation
 
-enum ProbeType: String {
+enum ProbeType: String, Codable, CaseIterable {
     case icmpEcho = "ICMP_ECHO"
     case dnsRecursor = "DNS_RECURSOR"
     case dnsAuth = "DNS_AUTH"
@@ -39,7 +39,7 @@ enum ProbeStatus: String {
     case failed = "PROBE_FAIL"
 }
 
-struct ProbeTarget {
+struct ProbeTarget: Codable, Equatable {
     let name: String
     let host: String
     let network: String
@@ -109,7 +109,7 @@ extension Character {
     }
 }
 
-let configuredTargets: [ProbeTarget] = [
+let defaultTargets: [ProbeTarget] = [
     .init(name: "Cloudflare DNS", host: "1.1.1.1", network: "AS13335 / anycast", scope: "global", probe: .dnsRecursor),
     .init(name: "Quad9 DNS", host: "9.9.9.9", network: "AS19281 / anycast", scope: "global", probe: .dnsRecursor),
     .init(name: "Google DNS", host: "8.8.8.8", network: "AS15169 / anycast", scope: "global", probe: .dnsRecursor),
@@ -121,6 +121,31 @@ let configuredTargets: [ProbeTarget] = [
     .init(name: "Hurricane Electric", host: "184.105.213.138", network: "AS6939 / US", scope: "operator", probe: .icmpEcho),
     .init(name: "LACNIC", host: "200.3.14.1", network: "AS28001 / UY", scope: "operator", probe: .icmpEcho)
 ]
+
+/// Persists the user-edited target list as JSON in Application Support, so
+/// `swift run` and the .app bundle share it (UserDefaults domains would differ).
+enum TargetStore {
+    static let fileURL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("ReachabilityDashboard/targets.json")
+
+    /// The saved list, or `defaultTargets` if there is none or it can't be
+    /// decoded. A bad file is left in place, never overwritten on load.
+    static func load() -> [ProbeTarget] {
+        guard let data = try? Data(contentsOf: fileURL),
+              let targets = try? JSONDecoder().decode([ProbeTarget].self, from: data) else {
+            return defaultTargets
+        }
+        return targets
+    }
+
+    static func save(_ targets: [ProbeTarget]) throws {
+        try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(),
+                                                withIntermediateDirectories: true)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try encoder.encode(targets).write(to: fileURL, options: .atomic)
+    }
+}
 
 final class CommandRunner {
     static func run(_ launchPath: String, _ arguments: [String], timeout: TimeInterval) -> CommandResult {
@@ -368,7 +393,7 @@ final class ProbeGraphView: NSView {
     /// line is almost always between two known samples and never reshapes.
     static let displayDelay: TimeInterval = 4
 
-    private let colors: [NSColor] = [
+    static let colors: [NSColor] = [
         .systemRed, .systemBlue, .systemGreen, .systemOrange, .systemPurple,
         .systemYellow, .systemPink, .systemTeal, .systemCyan, .systemBrown,
         .systemIndigo, .systemGray
@@ -436,7 +461,7 @@ final class ProbeGraphView: NSView {
         ctx.clip(to: NSRect(x: graphRect.minX, y: bounds.minY, width: graphRect.width, height: bounds.height))
 
         for (rowIndex, row) in rows.enumerated() {
-            let color = colors[rowIndex % colors.count]
+            let color = Self.colors[rowIndex % Self.colors.count]
             // Split into contiguous segments so failed probes break the line
             // instead of plunging it to the floor.
             var segments: [[CGPoint]] = []
@@ -577,7 +602,7 @@ final class ProbeGraphView: NSView {
         let fill = CGMutablePath()
         fill.move(to: CGPoint(x: points[0].x, y: baseline))
         fill.addLine(to: points[0])
-        addSmoothCurve(to: fill, through: points)
+        Self.addSmoothCurve(to: fill, through: points)
         fill.addLine(to: CGPoint(x: points.last!.x, y: baseline))
         fill.closeSubpath()
         ctx.addPath(fill)
@@ -604,7 +629,7 @@ final class ProbeGraphView: NSView {
         ctx.setLineCap(.round)
         let line = CGMutablePath()
         line.move(to: points[0])
-        addSmoothCurve(to: line, through: points)
+        Self.addSmoothCurve(to: line, through: points)
         ctx.addPath(line)
         ctx.strokePath()
         ctx.restoreGState()
@@ -616,20 +641,20 @@ final class ProbeGraphView: NSView {
 
     /// Appends a Catmull-Rom spline through `points` to `path`, which must
     /// already be positioned at `points[0]`. Produces smooth curved lines.
-    private func addSmoothCurve(to path: CGMutablePath, through points: [CGPoint]) {
+    static func addSmoothCurve(to path: CGMutablePath, through points: [CGPoint]) {
         guard points.count > 1 else { return }
         guard points.count > 2 else {
             path.addLine(to: points[1])
             return
         }
         for i in 0..<(points.count - 1) {
-            let (c1, c2) = controlPoints(points, segment: i)
+            let (c1, c2) = Self.controlPoints(points, segment: i)
             path.addCurve(to: points[i + 1], control1: c1, control2: c2)
         }
     }
 
     /// Bezier control points of the Catmull-Rom segment from points[i] to points[i + 1].
-    private func controlPoints(_ points: [CGPoint], segment i: Int) -> (CGPoint, CGPoint) {
+    private static func controlPoints(_ points: [CGPoint], segment i: Int) -> (CGPoint, CGPoint) {
         let p0 = points[max(i - 1, 0)]
         let p1 = points[i]
         let p2 = points[i + 1]
@@ -651,7 +676,7 @@ final class ProbeGraphView: NSView {
             let t = p2.x > p1.x ? (x - p1.x) / (p2.x - p1.x) : 1
             return CGPoint(x: x, y: p1.y + (p2.y - p1.y) * t)
         }
-        let (c1, c2) = controlPoints(points, segment: i)
+        let (c1, c2) = Self.controlPoints(points, segment: i)
         // x(t) is close to linear for evenly spaced samples, so use the x
         // fraction as the curve parameter.
         let t = p2.x > p1.x ? (x - p1.x) / (p2.x - p1.x) : 1
@@ -674,19 +699,82 @@ final class ProbeGraphView: NSView {
 
 }
 
+/// A miniature, single-row version of `ProbeGraphView` for the menu bar
+/// popover. Shares its time axis (window and display delay) and line color,
+/// but scales y to its own row so small latencies stay readable.
+final class SparklineView: NSView {
+    var samples: [(time: TimeInterval, latency: Int?)] = []
+    var now: TimeInterval = ProcessInfo.processInfo.systemUptime
+    var color: NSColor = .systemBlue
+
+    override var intrinsicContentSize: NSSize { NSSize(width: 120, height: 22) }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard let ctx = NSGraphicsContext.current?.cgContext else { return }
+        let rect = bounds.insetBy(dx: 0, dy: 3)
+        let span = ProbeGraphView.visibleWindow
+        let headTime = now - ProbeGraphView.displayDelay
+
+        let visible = samples.filter { $0.time >= headTime - span && $0.time <= headTime }.compactMap { $0.latency }
+        guard let rawMin = visible.min(), let rawMax = visible.max() else { return }
+        let minLatency = CGFloat(rawMin)
+        let range = CGFloat(max(rawMax - rawMin, 4))
+
+        func point(_ time: TimeInterval, _ value: Int) -> CGPoint {
+            CGPoint(x: rect.maxX - CGFloat((headTime - time) / span) * rect.width,
+                    y: rect.minY + (CGFloat(value) - minLatency) / range * rect.height)
+        }
+
+        // Same segmenting as the main graph: failures break the line, and a
+        // late probe holds its last value flat to the right edge.
+        var segments: [[CGPoint]] = []
+        var current: [CGPoint] = []
+        for sample in samples {
+            if let latency = sample.latency {
+                current.append(point(sample.time, latency))
+            } else if !current.isEmpty {
+                segments.append(current)
+                current = []
+            }
+        }
+        if let last = samples.last, let latency = last.latency, last.time < headTime {
+            current.append(point(headTime, latency))
+        }
+        if !current.isEmpty { segments.append(current) }
+
+        ctx.clip(to: bounds)
+        ctx.setStrokeColor(color.cgColor)
+        ctx.setLineWidth(1.5)
+        ctx.setLineJoin(.round)
+        ctx.setLineCap(.round)
+        for pts in segments where pts.count >= 2 {
+            let line = CGMutablePath()
+            line.move(to: pts[0])
+            ProbeGraphView.addSmoothCurve(to: line, through: pts)
+            ctx.addPath(line)
+        }
+        ctx.strokePath()
+    }
+}
+
 @MainActor
-final class DashboardController: NSObject, NSApplicationDelegate {
+final class DashboardController: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var window: NSWindow!
     private var graphView: ProbeGraphView!
     private var footerLabel: NSTextField!
     private var refreshButton: NSButton!
     private var versionLabel: NSTextField!
-    private var rows: [ProbeRow] = configuredTargets.map { ProbeRow(target: $0) }
+    private var rows: [ProbeRow] = TargetStore.load().map { ProbeRow(target: $0) }
     private let engine = ProbeEngine(timeout: 3)
     // Each probe runs its own independent loop, so a slow target never blocks
     // the others. `inFlight`/`scheduled` keep a single loop alive per probe.
     private var inFlight: [Bool] = []
     private var scheduled: [DispatchWorkItem?] = []
+    // Bumped whenever the target list is replaced. All per-probe state is
+    // indexed by position, so results from probes started under an older list
+    // are discarded instead of landing on the wrong (or a missing) row.
+    private var generation = 0
+    private lazy var targetEditor = TargetEditorController(engine: engine, probeQueue: probeQueue)
     private let probeQueue = DispatchQueue(label: "probes", qos: .utility, attributes: .concurrent)
     // Redraws the graph every frame so it scrolls continuously; samples are
     // only recorded when a probe completes.
@@ -696,7 +784,9 @@ final class DashboardController: NSObject, NSApplicationDelegate {
     private let popover = NSPopover()
     private var popoverDots: [NSTextField] = []
     private var popoverLatencies: [NSTextField] = []
+    private var popoverSparklines: [SparklineView] = []
     private var popoverSummary: NSTextField!
+    private var outsideClickMonitor: Any?
 
     private var buildNumber: Int {
         // Inside a .app bundle (built by bundle.sh) the working directory isn't
@@ -732,12 +822,7 @@ final class DashboardController: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         buildWindow()
         buildStatusItem()
-        validateRows()
-        inFlight = Array(repeating: false, count: rows.count)
-        scheduled = Array(repeating: nil, count: rows.count)
-        for index in rows.indices where rows[index].status != .configBad {
-            probeOnce(index)
-        }
+        startProbing()
         // .common mode keeps frames coming during live resize; assumeIsolated
         // (not a Task per frame) avoids scheduling jitter.
         let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
@@ -834,8 +919,37 @@ final class DashboardController: NSObject, NSApplicationDelegate {
             root.bottomAnchor.constraint(equalTo: window.contentView!.bottomAnchor),
             scrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 420)
         ])
+        // Not shown at launch: the app starts as a menu bar icon only, and the
+        // window appears via "Open Dashboard".
+    }
 
-        window.makeKeyAndOrderFront(nil)
+    /// (Re)starts every probe's loop for the current `rows`.
+    private func startProbing() {
+        validateRows()
+        inFlight = Array(repeating: false, count: rows.count)
+        scheduled = Array(repeating: nil, count: rows.count)
+        for index in rows.indices where rows[index].status != .configBad {
+            probeOnce(index)
+        }
+    }
+
+    /// Swaps in an edited target list at runtime. Targets whose host and probe
+    /// type are unchanged keep their graph history.
+    private func applyTargets(_ targets: [ProbeTarget]) {
+        generation += 1
+        scheduled.forEach { $0?.cancel() }
+        let old = rows
+        rows = targets.map { target in
+            var row = ProbeRow(target: target)
+            if let previous = old.first(where: { $0.target.host == target.host && $0.target.probe == target.probe }) {
+                row.samples = previous.samples
+            }
+            return row
+        }
+        rebuildPopover()
+        startProbing()
+        graphView.rows = rows
+        updateFooter()
     }
 
     private func validateRows() {
@@ -870,9 +984,11 @@ final class DashboardController: NSObject, NSApplicationDelegate {
 
         let target = rows[index].target
         let engine = self.engine
+        let generation = self.generation
         probeQueue.async {
             let outcome = engine.run(target)
             Task { @MainActor in
+                guard generation == self.generation else { return }
                 self.inFlight[index] = false
                 self.apply(outcome, at: index)
                 self.scheduleNext(index)
@@ -891,8 +1007,15 @@ final class DashboardController: NSObject, NSApplicationDelegate {
     /// Advances the graph's clock and redraws it — only while the window is
     /// actually on screen, so the menu-bar-only state stays near idle.
     private func renderFrame() {
+        let now = ProcessInfo.processInfo.systemUptime
+        if popover.isShown {
+            for sparkline in popoverSparklines {
+                sparkline.now = now
+                sparkline.needsDisplay = true
+            }
+        }
         guard window.isVisible, window.occlusionState.contains(.visible) else { return }
-        graphView.now = ProcessInfo.processInfo.systemUptime
+        graphView.now = now
         graphView.needsDisplay = true
     }
 
@@ -921,6 +1044,17 @@ final class DashboardController: NSObject, NSApplicationDelegate {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         statusItem.button?.target = self
         statusItem.button?.action = #selector(togglePopover)
+        popover.behavior = .transient
+        popover.delegate = self
+        rebuildPopover()
+    }
+
+    /// Builds the popover content for the current `rows`; called again
+    /// whenever the target list is edited.
+    private func rebuildPopover() {
+        popoverDots = []
+        popoverSparklines = []
+        popoverLatencies = []
 
         let title = NSTextField(labelWithString: "Operator Peering Quality")
         title.font = .systemFont(ofSize: 13, weight: .semibold)
@@ -932,24 +1066,33 @@ final class DashboardController: NSObject, NSApplicationDelegate {
         let grid = NSGridView()
         grid.rowSpacing = 4
         grid.columnSpacing = 8
-        for row in rows {
+        for (index, row) in rows.enumerated() {
             let dot = NSTextField(labelWithString: "●")
             let name = NSTextField(labelWithString: row.target.name)
+            let sparkline = SparklineView()
+            sparkline.color = ProbeGraphView.colors[index % ProbeGraphView.colors.count]
             let latency = NSTextField(labelWithString: "-")
             latency.font = .monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
             latency.alignment = .right
-            grid.addRow(with: [dot, name, latency])
+            grid.addRow(with: [dot, name, sparkline, latency])
             popoverDots.append(dot)
+            popoverSparklines.append(sparkline)
             popoverLatencies.append(latency)
         }
-        grid.column(at: 2).xPlacement = .trailing
+        grid.rowAlignment = .none
+        for index in 0..<grid.numberOfRows { grid.row(at: index).yPlacement = .center }
+        if grid.numberOfColumns > 3 {
+            grid.column(at: 3).xPlacement = .trailing
+        }
 
         let openButton = NSButton(title: "Open Dashboard", target: self, action: #selector(openDashboard))
         openButton.bezelStyle = .rounded
         openButton.keyEquivalent = "\r"
+        let editButton = NSButton(title: "Edit Targets…", target: self, action: #selector(editTargets))
+        editButton.bezelStyle = .rounded
         let quitButton = NSButton(title: "Quit", target: self, action: #selector(quit))
         quitButton.bezelStyle = .rounded
-        let buttons = NSStackView(views: [quitButton, NSView(), openButton])
+        let buttons = NSStackView(views: [quitButton, NSView(), editButton, openButton])
         buttons.orientation = .horizontal
 
         let stack = NSStackView(views: [title, popoverSummary, grid, buttons])
@@ -957,12 +1100,11 @@ final class DashboardController: NSObject, NSApplicationDelegate {
         stack.alignment = .leading
         stack.spacing = 10
         stack.edgeInsets = NSEdgeInsets(top: 14, left: 14, bottom: 14, right: 14)
-        buttons.widthAnchor.constraint(equalTo: grid.widthAnchor).isActive = true
+        buttons.widthAnchor.constraint(greaterThanOrEqualTo: grid.widthAnchor).isActive = true
 
         let content = NSViewController()
         content.view = stack
         popover.contentViewController = content
-        popover.behavior = .transient
 
         updateStatusItem()
     }
@@ -1000,6 +1142,7 @@ final class DashboardController: NSObject, NSApplicationDelegate {
             case .pending, .checking: .tertiaryLabelColor
             }
             popoverLatencies[index].stringValue = row.status == .configBad ? "config bad" : row.latencyText
+            popoverSparklines[index].samples = row.samples
         }
     }
 
@@ -1007,10 +1150,22 @@ final class DashboardController: NSObject, NSApplicationDelegate {
         if popover.isShown {
             popover.performClose(nil)
         } else if let button = statusItem.button {
-            // An accessory app must be active for the transient popover to
-            // close when the user clicks elsewhere.
-            NSApp.activate(ignoringOtherApps: true)
+            // Deliberately not activating the app: that would raise the
+            // dashboard and editor windows along with the popover. Without
+            // activation, transient popovers don't see clicks in other apps,
+            // so close on those via a global monitor (mouse monitors need no
+            // accessibility permission).
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+            outsideClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
+                MainActor.assumeIsolated { self?.popover.performClose(nil) }
+            }
+        }
+    }
+
+    func popoverDidClose(_ notification: Notification) {
+        if let monitor = outsideClickMonitor {
+            NSEvent.removeMonitor(monitor)
+            outsideClickMonitor = nil
         }
     }
 
@@ -1018,6 +1173,12 @@ final class DashboardController: NSObject, NSApplicationDelegate {
         popover.performClose(nil)
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
+    }
+
+    @objc private func editTargets() {
+        popover.performClose(nil)
+        targetEditor.onSave = { [weak self] targets in self?.applyTargets(targets) }
+        targetEditor.show(rows.map(\.target))
     }
 
     @objc private func quit() {
@@ -1033,9 +1194,294 @@ final class DashboardController: NSObject, NSApplicationDelegate {
     }
 }
 
+/// Window for editing the target list. Edits a working copy; nothing changes
+/// until Save, which persists to `TargetStore` and hands the list to `onSave`.
+@MainActor
+final class TargetEditorController: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSTextFieldDelegate {
+    var onSave: (([ProbeTarget]) -> Void)?
+
+    private let engine: ProbeEngine
+    private let probeQueue: DispatchQueue
+    private var targets: [ProbeTarget] = []
+    private var window: NSWindow!
+    private let table = NSTableView()
+    private let nameField = NSTextField()
+    private let hostField = NSTextField()
+    private let networkField = NSTextField()
+    private let scopeField = NSTextField()
+    private let probePopup = NSPopUpButton()
+    private let statusLabel = NSTextField(wrappingLabelWithString: "")
+    private var testButton: NSButton!
+    private var removeButton: NSButton!
+
+    init(engine: ProbeEngine, probeQueue: DispatchQueue) {
+        self.engine = engine
+        self.probeQueue = probeQueue
+        super.init()
+        buildWindow()
+    }
+
+    func show(_ current: [ProbeTarget]) {
+        targets = current
+        table.reloadData()
+        select(targets.isEmpty ? nil : 0)
+        setStatus("", color: .secondaryLabelColor)
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+    }
+
+    private func buildWindow() {
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 700, height: 420),
+                          styleMask: [.titled, .closable, .resizable],
+                          backing: .buffered, defer: false)
+        window.title = "Edit Targets"
+        window.isReleasedWhenClosed = false
+        window.center()
+
+        let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("target"))
+        table.addTableColumn(column)
+        table.headerView = nil
+        table.dataSource = self
+        table.delegate = self
+        let tableScroll = NSScrollView()
+        tableScroll.documentView = table
+        tableScroll.hasVerticalScroller = true
+        tableScroll.borderType = .bezelBorder
+        tableScroll.widthAnchor.constraint(equalToConstant: 280).isActive = true
+
+        for field in [nameField, hostField, networkField, scopeField] {
+            field.delegate = self
+        }
+        hostField.placeholderString = "IPv4 address or hostname"
+        probePopup.addItems(withTitles: ProbeType.allCases.map(\.rawValue))
+        probePopup.target = self
+        probePopup.action = #selector(formChanged)
+
+        let form = NSGridView(views: [
+            [NSTextField(labelWithString: "Name:"), nameField],
+            [NSTextField(labelWithString: "Host:"), hostField],
+            [NSTextField(labelWithString: "Probe:"), probePopup],
+            [NSTextField(labelWithString: "Network:"), networkField],
+            [NSTextField(labelWithString: "Scope:"), scopeField]
+        ])
+        form.rowSpacing = 8
+        form.column(at: 0).xPlacement = .trailing
+        form.column(at: 1).width = 300
+        let hint = NSTextField(wrappingLabelWithString: "DNS probes need an IPv4 host. Test runs one probe against the entered values without saving.")
+        hint.font = .systemFont(ofSize: 11)
+        hint.textColor = .secondaryLabelColor
+        testButton = NSButton(title: "Test", target: self, action: #selector(test))
+        testButton.bezelStyle = .rounded
+        statusLabel.font = .systemFont(ofSize: 12)
+
+        let detail = NSStackView(views: [form, hint, testButton, statusLabel])
+        detail.orientation = .vertical
+        detail.alignment = .leading
+        detail.spacing = 12
+
+        let addButton = NSButton(title: "Add", target: self, action: #selector(add))
+        removeButton = NSButton(title: "Remove", target: self, action: #selector(remove))
+        let resetButton = NSButton(title: "Reset to Defaults", target: self, action: #selector(resetToDefaults))
+        let cancelButton = NSButton(title: "Cancel", target: self, action: #selector(cancel))
+        cancelButton.keyEquivalent = "\u{1b}"
+        let saveButton = NSButton(title: "Save", target: self, action: #selector(save))
+        saveButton.keyEquivalent = "\r"
+        for button in [addButton, removeButton!, resetButton, cancelButton, saveButton] {
+            button.bezelStyle = .rounded
+        }
+
+        let body = NSStackView(views: [tableScroll, detail])
+        body.orientation = .horizontal
+        body.alignment = .top
+        body.spacing = 16
+        let footer = NSStackView(views: [addButton, removeButton, resetButton, NSView(), cancelButton, saveButton])
+        footer.orientation = .horizontal
+        let root = NSStackView(views: [body, footer])
+        root.orientation = .vertical
+        root.spacing = 12
+        root.edgeInsets = NSEdgeInsets(top: 16, left: 16, bottom: 16, right: 16)
+        window.contentView = root
+    }
+
+    // MARK: Table
+
+    func numberOfRows(in tableView: NSTableView) -> Int {
+        targets.count
+    }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        let target = targets[row]
+        let label = NSTextField(labelWithString: "\(target.name) — \(target.host) (\(target.probe.label))")
+        label.lineBreakMode = .byTruncatingTail
+        return label
+    }
+
+    func tableViewSelectionDidChange(_ notification: Notification) {
+        loadForm()
+    }
+
+    private var selectedIndex: Int? {
+        targets.indices.contains(table.selectedRow) ? table.selectedRow : nil
+    }
+
+    private func select(_ index: Int?) {
+        if let index {
+            table.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
+            table.scrollRowToVisible(index)
+        } else {
+            table.deselectAll(nil)
+        }
+        loadForm()
+    }
+
+    // MARK: Form
+
+    private func loadForm() {
+        let target = selectedIndex.map { targets[$0] }
+        for field in [nameField, hostField, networkField, scopeField] {
+            field.isEnabled = target != nil
+        }
+        probePopup.isEnabled = target != nil
+        testButton.isEnabled = target != nil
+        removeButton.isEnabled = target != nil
+        nameField.stringValue = target?.name ?? ""
+        hostField.stringValue = target?.host ?? ""
+        networkField.stringValue = target?.network ?? ""
+        scopeField.stringValue = target?.scope ?? ""
+        probePopup.selectItem(withTitle: (target?.probe ?? .icmpEcho).rawValue)
+    }
+
+    func controlTextDidChange(_ obj: Notification) {
+        formChanged()
+    }
+
+    @objc private func formChanged() {
+        guard let index = selectedIndex else { return }
+        targets[index] = ProbeTarget(
+            name: nameField.stringValue.trimmingCharacters(in: .whitespaces),
+            host: hostField.stringValue.trimmingCharacters(in: .whitespaces),
+            network: networkField.stringValue.trimmingCharacters(in: .whitespaces),
+            scope: scopeField.stringValue.trimmingCharacters(in: .whitespaces),
+            probe: ProbeType.allCases[max(probePopup.indexOfSelectedItem, 0)]
+        )
+        table.reloadData(forRowIndexes: IndexSet(integer: index), columnIndexes: IndexSet(integer: 0))
+    }
+
+    /// Why a target can't be probed or saved, or nil if it's fine. Host
+    /// validation also keeps user input from being read as a command-line
+    /// option by ping/dig/curl.
+    private func problem(with target: ProbeTarget) -> String? {
+        if target.name.isEmpty { return "name is empty" }
+        return engine.validate(target)
+    }
+
+    private func setStatus(_ text: String, color: NSColor) {
+        statusLabel.stringValue = text
+        statusLabel.textColor = color
+    }
+
+    // MARK: Actions
+
+    @objc private func test() {
+        guard let index = selectedIndex else { return }
+        let target = targets[index]
+        if let problem = problem(with: target) {
+            setStatus("Can't test: \(problem)", color: .systemRed)
+            return
+        }
+        testButton.isEnabled = false
+        setStatus("Testing \(target.host)…", color: .secondaryLabelColor)
+        let engine = self.engine
+        // engine.run blocks for up to the probe timeout; keep it off main.
+        probeQueue.async {
+            let outcome = engine.run(target)
+            Task { @MainActor in
+                self.testButton.isEnabled = self.selectedIndex != nil
+                if outcome.status == .ok, let latency = outcome.latencyMs {
+                    self.setStatus("\(target.name): OK — \(latency) ms", color: .systemGreen)
+                } else {
+                    self.setStatus("\(target.name): \(outcome.status.rawValue) — \(outcome.error ?? "no response")", color: .systemRed)
+                }
+            }
+        }
+    }
+
+    @objc private func add() {
+        targets.append(ProbeTarget(name: "New target", host: "", network: "", scope: "", probe: .icmpEcho))
+        table.reloadData()
+        select(targets.count - 1)
+        window.makeFirstResponder(hostField)
+    }
+
+    @objc private func remove() {
+        guard let index = selectedIndex else { return }
+        targets.remove(at: index)
+        table.reloadData()
+        select(targets.isEmpty ? nil : min(index, targets.count - 1))
+    }
+
+    @objc private func resetToDefaults() {
+        targets = defaultTargets
+        table.reloadData()
+        select(0)
+        setStatus("Restored the default targets — Save to apply.", color: .secondaryLabelColor)
+    }
+
+    @objc private func cancel() {
+        window.close()
+    }
+
+    @objc private func save() {
+        guard !targets.isEmpty else {
+            setStatus("Add at least one target.", color: .systemRed)
+            return
+        }
+        if let index = targets.indices.first(where: { problem(with: targets[$0]) != nil }) {
+            select(index)
+            setStatus("Fix \"\(targets[index].name)\": \(problem(with: targets[index]) ?? "")", color: .systemRed)
+            return
+        }
+        do {
+            try TargetStore.save(targets)
+        } catch {
+            setStatus("Couldn't save: \(error.localizedDescription)", color: .systemRed)
+            return
+        }
+        onSave?(targets)
+        window.close()
+    }
+}
+
+/// Accessory apps show no menu bar, but the main menu's key equivalents still
+/// work while the app is active — needed for copy/paste in the target editor.
+@MainActor
+func buildMainMenu() -> NSMenu {
+    let mainMenu = NSMenu()
+
+    let appMenu = NSMenu()
+    appMenu.addItem(withTitle: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+    mainMenu.addItem(withTitle: "", action: nil, keyEquivalent: "").submenu = appMenu
+
+    let editMenu = NSMenu(title: "Edit")
+    editMenu.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
+    editMenu.addItem(withTitle: "Redo", action: Selector(("redo:")), keyEquivalent: "Z")
+    editMenu.addItem(.separator())
+    editMenu.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+    editMenu.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+    editMenu.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+    editMenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+    mainMenu.addItem(withTitle: "Edit", action: nil, keyEquivalent: "").submenu = editMenu
+
+    let windowMenu = NSMenu(title: "Window")
+    windowMenu.addItem(withTitle: "Close", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+    mainMenu.addItem(withTitle: "Window", action: nil, keyEquivalent: "").submenu = windowMenu
+
+    return mainMenu
+}
+
 let app = NSApplication.shared
+app.mainMenu = buildMainMenu()
 let delegate = DashboardController()
 app.delegate = delegate
 app.setActivationPolicy(.accessory)
-app.activate(ignoringOtherApps: true)
 app.run()

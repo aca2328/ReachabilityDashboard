@@ -11,7 +11,7 @@ Native macOS dashboard (AppKit, Swift 6) monitoring ICMP/DNS/HTTPS probe latency
 
 ## Architecture
 Single file: `Sources/ReachabilityDashboard/main.swift` (~800 lines).
-- `ProbeTarget`/`ProbeRow` — static target list (`configuredTargets`) + per-target running state/history
+- `ProbeTarget`/`ProbeRow` — target list + per-target running state/history. `TargetStore` loads the list from `~/Library/Application Support/ReachabilityDashboard/targets.json` (falls back to `defaultTargets` if missing or undecodable); `TargetEditorController` edits it from the popover. `dashboard.sh` keeps its own hardcoded list
 - `ProbeEngine` — validates and executes probes by shelling out to `/sbin/ping`, `/usr/bin/dig`, `/usr/bin/curl`; pure parsing logic (`parsePingOutput`, `parseDigOutput`, `parseCurlOutput`, `isIPv4`, `isHostname`) is split out from process execution so it's unit-testable
 - `ProbeGraphView` — custom NSView drawing the neon multi-line latency graph (Catmull-Rom smoothing, glow, floating labels)
 - `DashboardController` — AppKit app delegate; owns the window, the menu bar status item/popover, and the per-probe scheduling loop. Runs as an accessory app (no Dock icon); closing the window keeps it running, quit from the popover
