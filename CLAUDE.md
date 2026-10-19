@@ -6,6 +6,7 @@ Native macOS dashboard (AppKit, Swift 6) monitoring ICMP/DNS/HTTPS probe latency
 - Run in dev: `swift run ReachabilityDashboard`
 - Build release: `swift build --configuration release`
 - Build+run latest (pulls origin, clean rebuild): `./run.sh`
+- Package `.app` (universal, ad-hoc signed): `./bundle.sh`; publish a GitHub release `v1.0.<commit count>` with the zipped app: `./release.sh` (needs a clean tree pushed to `main`)
 - Legacy bash TUI (still maintained as fallback): `./dashboard.sh`
 - Run unit tests: `swift test` (Swift Testing, in `Tests/ReachabilityDashboardTests/`). Requires full Xcode installed (not just Command Line Tools) — without it, `swift test` can't locate the `Testing` framework.
 
