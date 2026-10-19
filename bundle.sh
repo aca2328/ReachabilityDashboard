@@ -3,7 +3,7 @@
 # Build script that packages ReachabilityDashboard as a macOS .app bundle
 # This script:
 # 1. Builds the project in release mode
-# 2. Wraps the binary in .build/ReachabilityDashboard.app
+# 2. Wraps the binary in .build/ReachabilityDashboard.app with its icon (make-icon.swift)
 # 3. Bakes the git commit count into Info.plist as the build number
 # 4. Ad-hoc signs the bundle
 
@@ -21,8 +21,13 @@ swift build --configuration release
 
 echo "📦 Creating $APP_DIR..."
 rm -rf "$APP_DIR"
-mkdir -p "$APP_DIR/Contents/MacOS"
+mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
 cp "$(swift build --configuration release --show-bin-path)/$APP_NAME" "$APP_DIR/Contents/MacOS/$APP_NAME"
+
+echo "🎨 Rendering app icon..."
+rm -rf .build/AppIcon.iconset
+swift make-icon.swift .build/AppIcon.iconset
+iconutil --convert icns .build/AppIcon.iconset --output "$APP_DIR/Contents/Resources/AppIcon.icns"
 
 cat > "$APP_DIR/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -31,6 +36,8 @@ cat > "$APP_DIR/Contents/Info.plist" <<EOF
 <dict>
     <key>CFBundleExecutable</key>
     <string>$APP_NAME</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundleIdentifier</key>
     <string>org.camerlo.$APP_NAME</string>
     <key>CFBundleName</key>
