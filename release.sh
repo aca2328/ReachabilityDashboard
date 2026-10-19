@@ -4,7 +4,7 @@
 # This script:
 # 1. Checks the working tree is clean and main is pushed
 # 2. Builds the .app bundle with bundle.sh
-# 3. Zips it and creates release v1.0.<build number> with gh
+# 3. Zips it with LICENSE and creates release v1.0.<build number> with gh
 
 set -e
 
@@ -33,8 +33,10 @@ fi
 ./bundle.sh
 
 echo "🗜  Zipping..."
-rm -f "$ZIP"
-ditto -c -k --keepParent ".build/$APP_NAME.app" "$ZIP"
+rm -rf "$ZIP" .build/release-zip
+mkdir .build/release-zip
+cp -R ".build/$APP_NAME.app" LICENSE .build/release-zip/
+ditto -c -k .build/release-zip "$ZIP"
 
 echo "🚀 Creating release $TAG..."
 gh release create "$TAG" "$ZIP" --target "$(git rev-parse HEAD)" --title "$APP_NAME ${TAG#v}" --notes-file - <<'EOF'
