@@ -661,16 +661,20 @@ final class ProbeGraphView: NSView {
     private func drawGlowLine(_ ctx: CGContext, points: [CGPoint], color: NSColor) {
         guard !points.isEmpty else { return }
         ctx.saveGState()
-        ctx.setShadow(offset: .zero, blur: 9, color: color.withAlphaComponent(0.9).cgColor)
-        ctx.setStrokeColor(color.cgColor)
-        ctx.setLineWidth(2.5)
         ctx.setLineJoin(.round)
         ctx.setLineCap(.round)
         let line = CGMutablePath()
         line.move(to: points[0])
         Self.addSmoothCurve(to: line, through: points)
-        ctx.addPath(line)
-        ctx.strokePath()
+        // The glow is a few wide translucent strokes under the line rather than
+        // a shadow blur: CG computes shadows with a CPU convolution every
+        // frame, which made the blur most of the visible window's CPU cost.
+        for (width, alpha) in [(14.0, 0.06), (9.0, 0.10), (5.5, 0.22), (2.5, 1.0)] as [(CGFloat, CGFloat)] {
+            ctx.setStrokeColor(color.withAlphaComponent(alpha).cgColor)
+            ctx.setLineWidth(width)
+            ctx.addPath(line)
+            ctx.strokePath()
+        }
         ctx.restoreGState()
 
         if points.count == 1 {
@@ -725,12 +729,11 @@ final class ProbeGraphView: NSView {
     }
 
     private func drawEndDot(_ ctx: CGContext, at point: CGPoint, color: NSColor) {
-        ctx.saveGState()
-        ctx.setShadow(offset: .zero, blur: 12, color: color.cgColor)
-        ctx.setFillColor(color.cgColor)
-        let r: CGFloat = 4
-        ctx.fillEllipse(in: CGRect(x: point.x - r, y: point.y - r, width: r * 2, height: r * 2))
-        ctx.restoreGState()
+        // Halo rings instead of a shadow blur, for the same reason as drawGlowLine.
+        for (r, alpha) in [(11.0, 0.08), (7.5, 0.18), (4.0, 1.0)] as [(CGFloat, CGFloat)] {
+            ctx.setFillColor(color.withAlphaComponent(alpha).cgColor)
+            ctx.fillEllipse(in: CGRect(x: point.x - r, y: point.y - r, width: r * 2, height: r * 2))
+        }
 
         ctx.setFillColor(NSColor.white.withAlphaComponent(0.9).cgColor)
         ctx.fillEllipse(in: CGRect(x: point.x - 1.5, y: point.y - 1.5, width: 3, height: 3))
@@ -804,7 +807,7 @@ final class SparklineView: NSView {
 }
 
 @MainActor
-final class DashboardController: NSObject, NSApplicationDelegate, NSPopoverDelegate {
+final class DashboardController: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSWindowDelegate {
     private var window: NSWindow!
     private var graphView: ProbeGraphView!
     private var footerLabel: NSTextField!
@@ -833,6 +836,7 @@ final class DashboardController: NSObject, NSApplicationDelegate, NSPopoverDeleg
     private var popoverSparklines: [SparklineView] = []
     private var popoverSummary: NSTextField!
     private var outsideClickMonitor: Any?
+    private var lastHealth: NSColor?
 
     private var buildNumber: Int {
         // Inside a .app bundle (built by bundle.sh) the working directory isn't
@@ -869,6 +873,12 @@ final class DashboardController: NSObject, NSApplicationDelegate, NSPopoverDeleg
         buildWindow()
         buildStatusItem()
         startProbing()
+        // No frame timer yet: it only runs while the dashboard or popover is
+        // visible (see startFrameTimer/stopFrameTimerIfIdle).
+    }
+
+    private func startFrameTimer() {
+        guard frameTimer == nil else { return }
         // .common mode keeps frames coming during live resize; assumeIsolated
         // (not a Task per frame) avoids scheduling jitter.
         let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
@@ -878,7 +888,36 @@ final class DashboardController: NSObject, NSApplicationDelegate, NSPopoverDeleg
         frameTimer = timer
     }
 
+    /// Stops the 60 Hz timer when nothing animated is on screen, so the app
+    /// doesn't wake 60 times a second while it sits in the menu bar.
+    private func stopFrameTimerIfIdle() {
+        guard !popover.isShown, !(window.isVisible && window.occlusionState.contains(.visible)) else { return }
+        frameTimer?.invalidate()
+        frameTimer = nil
+    }
+
+    // Covers every way the window appears or disappears: open, close,
+    // minimize, Space switches, and being covered by other windows.
+    func windowDidChangeOcclusionState(_ notification: Notification) {
+        if window.isVisible && window.occlusionState.contains(.visible) {
+            startFrameTimer()
+        } else {
+            stopFrameTimerIfIdle()
+        }
+    }
+
+    func popoverWillShow(_ notification: Notification) {
+        startFrameTimer()
+    }
+
     // Closing the window just hides it; the app keeps probing in the menu bar.
+    // Launching the app again while it's running (Finder, Spotlight, `open`)
+    // shows the dashboard, as is usual for menu bar apps.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        openDashboard()
+        return false
+    }
+
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         false
     }
@@ -888,10 +927,11 @@ final class DashboardController: NSObject, NSApplicationDelegate, NSPopoverDeleg
             contentRect: NSRect(x: 0, y: 0, width: 1120, height: 620),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
-            defer: false
+            defer: true  // no backing store (or ~16 MB graph drawable) until first shown
         )
         window.title = "Operator Peering Quality Dashboard"
         window.isReleasedWhenClosed = false
+        window.delegate = self
         window.center()
 
         let root = NSStackView()
@@ -1173,12 +1213,24 @@ final class DashboardController: NSObject, NSApplicationDelegate, NSPopoverDeleg
         } else {
             health = .systemOrange
         }
-        let config = NSImage.SymbolConfiguration(pointSize: 14, weight: .medium)
-            .applying(NSImage.SymbolConfiguration(paletteColors: [health]))
-        statusItem.button?.image = NSImage(systemSymbolName: "antenna.radiowaves.left.and.right",
-                                           accessibilityDescription: "Reachability")?
-            .withSymbolConfiguration(config)
+        // Only swap the image when health changes: re-rendering the SF Symbol
+        // on every probe result (~8/s) was the app's main idle CPU cost.
+        if health != lastHealth {
+            lastHealth = health
+            let config = NSImage.SymbolConfiguration(pointSize: 14, weight: .medium)
+                .applying(NSImage.SymbolConfiguration(paletteColors: [health]))
+            statusItem.button?.image = NSImage(systemSymbolName: "antenna.radiowaves.left.and.right",
+                                               accessibilityDescription: "Reachability")?
+                .withSymbolConfiguration(config)
+        }
+        if popover.isShown {
+            refreshPopover()
+        }
+    }
 
+    /// Updates the popover's rows. Skipped while it's closed and run just
+    /// before it opens instead.
+    private func refreshPopover() {
         popoverSummary.stringValue = footerLabel.stringValue
         for (index, row) in rows.enumerated() where index < popoverDots.count {
             popoverDots[index].textColor = switch row.status {
@@ -1201,11 +1253,23 @@ final class DashboardController: NSObject, NSApplicationDelegate, NSPopoverDeleg
             // activation, transient popovers don't see clicks in other apps,
             // so close on those via a global monitor (mouse monitors need no
             // accessibility permission).
+            refreshPopover()
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+            // A late popoverDidClose could otherwise drop the new token and leak the old monitor.
+            if let monitor = outsideClickMonitor {
+                NSEvent.removeMonitor(monitor)
+            }
             outsideClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
                 MainActor.assumeIsolated { self?.popover.performClose(nil) }
             }
         }
+    }
+
+    // The window is kept for reuse, but its layer-backed graph would keep a
+    // ~16 MB drawable alive while hidden; drop it. The first visible frame
+    // after reopening redraws it.
+    func windowWillClose(_ notification: Notification) {
+        graphView.layer?.contents = nil
     }
 
     func popoverDidClose(_ notification: Notification) {
@@ -1213,12 +1277,15 @@ final class DashboardController: NSObject, NSApplicationDelegate, NSPopoverDeleg
             NSEvent.removeMonitor(monitor)
             outsideClickMonitor = nil
         }
+        stopFrameTimerIfIdle()
     }
 
     @objc private func openDashboard() {
         popover.performClose(nil)
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
+        // Also started by the occlusion callback; this guarantees it on first show.
+        startFrameTimer()
     }
 
     @objc private func editTargets() {
