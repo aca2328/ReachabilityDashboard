@@ -62,3 +62,7 @@ The list is stored in `~/Library/Application Support/ReachabilityDashboard/targe
 - `HTTPS_GET`: full HTTPS request timing and HTTP status validation.
 
 DNS probes need an IPv4 host. Probes call `/sbin/ping`, `/usr/bin/dig`, and `/usr/bin/curl`; a target whose tool is missing is marked config bad rather than failing the app.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
